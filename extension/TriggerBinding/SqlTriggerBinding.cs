@@ -4,6 +4,9 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Executors;
@@ -110,13 +113,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>
         /// The listener
         /// </returns>
-        public Task<IListener> CreateListenerAsync(ListenerFactoryContext context)
+        public async Task<IListener> CreateListenerAsync(ListenerFactoryContext context)
         {
             if (context == null)
             {
                 throw new ArgumentNullException("context", "Missing listener context");
             }
-            return Task.FromResult<IListener>(new SqlTriggerListener<T>(_table, _connectionString, context.Executor, _hostIdProvider, _logger));
+
+            string workerId = await GetWorkerIdAsync();
+            return new SqlTriggerListener<T>(_table, _connectionString, workerId, context.Executor, _logger);
         }
 
         /// <returns> A description of the SqlTriggerParameter (<see cref="SqlTriggerParameterDescriptor"/> </returns>
@@ -128,6 +133,19 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 Type = "SqlTrigger",
                 TableName = _table
             };
+        }
+
+        private async Task<string> GetWorkerIdAsync()
+        {
+            string hostId = await _hostIdProvider.GetHostIdAsync(CancellationToken.None);
+
+            using var md5 = MD5.Create();
+            var methodInfo = (MethodInfo)_parameter.Member;
+            string functionName = $"{methodInfo.DeclaringType.FullName}.{methodInfo.Name}";
+            byte[] functionHash = md5.ComputeHash(Encoding.UTF8.GetBytes(functionName));
+            string functionId = new Guid(functionHash).ToString("N").Substring(0, 8);
+
+            return $"{hostId}_{functionId}";
         }
 
         /// <summary>

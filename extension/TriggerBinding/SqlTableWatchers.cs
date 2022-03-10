@@ -379,7 +379,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                                 return reader.GetInt64(0);
                             }
                         }
-                    }   
+                    }
                 }
                 return -1;
             }
@@ -539,11 +539,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             /// <param name="table"> 
             /// The name of the user table that changes are being tracked on
             /// </param>
+            /// <param name="workerId">
+            /// The worker application ID
+            /// </param>
             /// <param name="executor">
             /// Used to execute the user's function when changes are detected on "table"
-            /// </param>
-            /// <param name="hostIdProvider">
-            /// Used to fetch a unique host identifier
             /// </param>
             /// <exception cref="ArgumentNullException">
             /// Thrown if the executor or logger is null
@@ -551,26 +551,17 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             /// <exception cref="ArgumentException">
             /// Thrown if table or connectionString are null or empty
             /// </exception>
-            public SqlTableChangeMonitor(string table, string connectionString, ITriggeredFunctionExecutor executor, IHostIdProvider hostIdProvider, ILogger logger)
+            public SqlTableChangeMonitor(string table, string connectionString, string workerId, ITriggeredFunctionExecutor executor, ILogger logger)
             {
-                if (string.IsNullOrEmpty(table))
-                {
-                    throw new ArgumentException("User table name cannot be null or empty");
-                }
-                if (string.IsNullOrEmpty(connectionString))
-                {
-                    throw new ArgumentException("SQL connection string cannot be null or empty");
-                }
-
-                _connectionString = connectionString;
+                _ = !string.IsNullOrEmpty(table) ? table : throw new ArgumentNullException(nameof(table));
+                _connectionString = !string.IsNullOrEmpty(connectionString) ? connectionString : throw new ArgumentNullException(nameof(connectionString));
+                _workerID = !string.IsNullOrEmpty(workerId) ? workerId : throw new ArgumentNullException(nameof(workerId));
                 _executor = executor ?? throw new ArgumentNullException(nameof(executor));
-                _ = hostIdProvider ?? throw new ArgumentNullException(nameof(hostIdProvider));
                 _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
                 _userTable = SqlBindingUtilities.NormalizeTableName(table);
                 _globalStateTable = $"[{SqlTriggerConstants.Schema}].[{SqlTriggerConstants.GlobalStateTable}]";
                 _workerBatchSizesTable = $"[{SqlTriggerConstants.Schema}].[{SqlTriggerConstants.WorkerBatchSizesTable}]";
-
-                _workerID = hostIdProvider.GetHostIdAsync(CancellationToken.None).GetAwaiter().GetResult();
 
                 _cancellationTokenSourceExecutor = new CancellationTokenSource();
                 _cancellationTokenSourceCheckForChanges = new CancellationTokenSource();

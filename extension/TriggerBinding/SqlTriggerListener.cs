@@ -25,15 +25,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="table"> 
         /// The name of the user table that changes are being tracked on
         /// </param>
+        /// <param name="workerId">
+        /// The worker application ID
+        /// </param>
         /// <param name="executor">
         /// Used to execute the user's function when changes are detected on "table"
         /// </param>
-        /// <param name="hostIdProvider">
-        /// Used to fetch a unique host identifier
-        /// </param>
-        public SqlTriggerListener(string table, string connectionString, ITriggeredFunctionExecutor executor, IHostIdProvider hostIdProvider, ILogger logger)
+        public SqlTriggerListener(string table, string connectionString, string workerId, ITriggeredFunctionExecutor executor, ILogger logger)
         {
-            _watcher = new SqlTableWatchers.SqlTableChangeMonitor<T>(table, connectionString, executor, hostIdProvider, logger);
+            _watcher = new SqlTableWatchers.SqlTableChangeMonitor<T>(table, connectionString, workerId, executor, logger);
             _state = State.NotInitialized;
         }
 
