@@ -5,6 +5,7 @@ using System;
 using System.Collections;
 using System.Reflection;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Triggers;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Extensions.Configuration;
@@ -15,6 +16,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     internal class SqlTriggerAttributeBindingProvider : ITriggerBindingProvider
     {
         private readonly IConfiguration _configuration;
+        private readonly IHostIdProvider _hostIdProvider;
         private readonly ILogger _logger;
 
         /// <summary>
@@ -23,19 +25,20 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="configuration">
         /// Used to extract the connection string from connectionStringSetting
         /// </param>
+        /// <param name="hostIdProvider">
+        /// Used to fetch a unique host identifier
+        /// </param>
         /// <param name="loggerFactory">
         /// Used to create a logger for the SQL trigger binding
         /// </param>
         /// <exception cref="ArgumentNullException">
         /// Thrown if either parameter is null
         /// </exception>
-        public SqlTriggerAttributeBindingProvider(IConfiguration configuration, ILoggerFactory loggerFactory)
+        public SqlTriggerAttributeBindingProvider(IConfiguration configuration, IHostIdProvider hostIdProvider, ILoggerFactory loggerFactory)
         {
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
-            if (loggerFactory == null)
-            {
-                throw new ArgumentNullException(nameof(loggerFactory));
-            }
+            _hostIdProvider = hostIdProvider ?? throw new ArgumentNullException(nameof(hostIdProvider));
+            _ = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
             _logger = loggerFactory.CreateLogger(LogCategories.CreateTriggerCategory("Sql"));
         }
 
@@ -79,9 +82,9 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
             Type type = parameter.ParameterType.GetGenericArguments()[0].GetGenericArguments()[0];
             Type typeOfTriggerBinding = typeof(SqlTriggerBinding<>).MakeGenericType(type);
-            ConstructorInfo constructor = typeOfTriggerBinding.GetConstructor(new Type[] { typeof(string), typeof(string), typeof(ParameterInfo), typeof(ILogger) });
+            ConstructorInfo constructor = typeOfTriggerBinding.GetConstructor(new Type[] { typeof(string), typeof(string), typeof(ParameterInfo), typeof(IHostIdProvider), typeof(ILogger) });
             return Task.FromResult<ITriggerBinding>((ITriggerBinding)constructor.Invoke(new object[] {attribute.TableName,
-                SqlBindingUtilities.GetConnectionString(attribute.ConnectionStringSetting, _configuration), parameter, _logger }));
+                SqlBindingUtilities.GetConnectionString(attribute.ConnectionStringSetting, _configuration), parameter, _hostIdProvider, _logger }));
         }
 
         /// <summary>

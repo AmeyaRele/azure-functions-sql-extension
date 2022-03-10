@@ -6,6 +6,7 @@ using Microsoft.Azure.WebJobs.Description;
 using static Microsoft.Azure.WebJobs.Extensions.Sql.SqlConverters;
 using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -19,6 +20,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     internal class SqlBindingConfigProvider : IExtensionConfigProvider
     {
         private readonly IConfiguration _configuration;
+        private readonly IHostIdProvider _hostIdProvider;
         private readonly ILoggerFactory _loggerFactory;
 
         /// <summary>
@@ -27,9 +29,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <exception cref="ArgumentNullException">
         /// Thrown if either parameter is null
         /// </exception>
-        public SqlBindingConfigProvider(IConfiguration configuration, ILoggerFactory loggerFactory)
+        public SqlBindingConfigProvider(IConfiguration configuration, IHostIdProvider hostIdProvider, ILoggerFactory loggerFactory)
         {
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _hostIdProvider = hostIdProvider ?? throw new ArgumentNullException(nameof(hostIdProvider));
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         }
 
@@ -54,7 +57,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             inputOutputRule.BindToInput<OpenType>(typeof(SqlGenericsConverter<>), _configuration);
 
             var triggerRule = context.AddBindingRule<SqlTriggerAttribute>();
-            triggerRule.BindToTrigger(new SqlTriggerAttributeBindingProvider(_configuration, _loggerFactory));
+            triggerRule.BindToTrigger(new SqlTriggerAttributeBindingProvider(_configuration, _hostIdProvider, _loggerFactory));
         }
     }
 }

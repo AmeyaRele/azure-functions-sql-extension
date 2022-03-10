@@ -531,7 +531,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             private int _leaseRenewalCount;
 
             /// <summary>
-            /// Initializes a new instance of the <see cref="SqlTableChangeMonitor<typeparamref name="T"/>> class
+            /// Initializes a new instance of the <see cref="SqlTableChangeMonitor{T}" />> class
             /// </summary>
             /// <param name="connectionString">
             /// The SQL connection string used to connect to the user's database
@@ -542,13 +542,16 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             /// <param name="executor">
             /// Used to execute the user's function when changes are detected on "table"
             /// </param>
+            /// <param name="hostIdProvider">
+            /// Used to fetch a unique host identifier
+            /// </param>
             /// <exception cref="ArgumentNullException">
             /// Thrown if the executor or logger is null
             /// </exception>
             /// <exception cref="ArgumentException">
             /// Thrown if table or connectionString are null or empty
             /// </exception>
-            public SqlTableChangeMonitor(string table, string connectionString, ITriggeredFunctionExecutor executor, ILogger logger)
+            public SqlTableChangeMonitor(string table, string connectionString, ITriggeredFunctionExecutor executor, IHostIdProvider hostIdProvider, ILogger logger)
             {
                 if (string.IsNullOrEmpty(table))
                 {
@@ -561,12 +564,13 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
                 _connectionString = connectionString;
                 _executor = executor ?? throw new ArgumentNullException(nameof(executor));
+                _ = hostIdProvider ?? throw new ArgumentNullException(nameof(hostIdProvider));
                 _logger = logger ?? throw new ArgumentNullException(nameof(logger));
                 _userTable = SqlBindingUtilities.NormalizeTableName(table);
                 _globalStateTable = $"[{SqlTriggerConstants.Schema}].[{SqlTriggerConstants.GlobalStateTable}]";
                 _workerBatchSizesTable = $"[{SqlTriggerConstants.Schema}].[{SqlTriggerConstants.WorkerBatchSizesTable}]";
-                // For now use the machine name as the worker ID
-                _workerID = Environment.MachineName;
+
+                _workerID = hostIdProvider.GetHostIdAsync(CancellationToken.None).GetAwaiter().GetResult();
 
                 _cancellationTokenSourceExecutor = new CancellationTokenSource();
                 _cancellationTokenSourceCheckForChanges = new CancellationTokenSource();

@@ -17,7 +17,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         private State _state;
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="SqlTriggerListener<typeparamref name="T"/>>
+        /// Initializes a new instance of the <see cref="SqlTriggerListener{T}" />>
         /// </summary>
         /// <param name="connectionString">
         /// The SQL connection string used to connect to the user's database
@@ -28,9 +28,12 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="executor">
         /// Used to execute the user's function when changes are detected on "table"
         /// </param>
-        public SqlTriggerListener(string table, string connectionString, ITriggeredFunctionExecutor executor, ILogger logger)
+        /// <param name="hostIdProvider">
+        /// Used to fetch a unique host identifier
+        /// </param>
+        public SqlTriggerListener(string table, string connectionString, ITriggeredFunctionExecutor executor, IHostIdProvider hostIdProvider, ILogger logger)
         {
-            _watcher = new SqlTableWatchers.SqlTableChangeMonitor<T>(table, connectionString, executor, logger);
+            _watcher = new SqlTableWatchers.SqlTableChangeMonitor<T>(table, connectionString, executor, hostIdProvider, logger);
             _state = State.NotInitialized;
         }
 

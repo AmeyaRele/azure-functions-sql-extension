@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Bindings;
+using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Listeners;
 using Microsoft.Azure.WebJobs.Host.Protocols;
 using Microsoft.Azure.WebJobs.Host.Triggers;
@@ -22,6 +23,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         private readonly string _connectionString;
         private readonly string _table;
         private readonly ParameterInfo _parameter;
+        private readonly IHostIdProvider _hostIdProvider;
         private readonly ILogger _logger;
         private static readonly IReadOnlyDictionary<string, Type> _emptyBindingContract = new Dictionary<string, Type>();
 
@@ -37,14 +39,18 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="parameter">
         /// The parameter that contains the SqlTriggerAttribute of the user's function
         /// </param>
+        /// <param name="hostIdProvider">
+        /// Used to fetch a unique host identifier
+        /// </param>
         /// <exception cref="ArgumentNullException">
         /// Thrown if any of the parameters are null
         /// </exception>
-        public SqlTriggerBinding(string table, string connectionString, ParameterInfo parameter, ILogger logger)
+        public SqlTriggerBinding(string table, string connectionString, ParameterInfo parameter, IHostIdProvider hostIdProvider, ILogger logger)
         {
             _table = table ?? throw new ArgumentNullException(nameof(table));
             _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
             _parameter = parameter ?? throw new ArgumentNullException(nameof(parameter));
+            _hostIdProvider = hostIdProvider ?? throw new ArgumentNullException(nameof(hostIdProvider));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
@@ -110,7 +116,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             {
                 throw new ArgumentNullException("context", "Missing listener context");
             }
-            return Task.FromResult<IListener>(new SqlTriggerListener<T>(_table, _connectionString, context.Executor, _logger));
+            return Task.FromResult<IListener>(new SqlTriggerListener<T>(_table, _connectionString, context.Executor, _hostIdProvider, _logger));
         }
 
         /// <returns> A description of the SqlTriggerParameter (<see cref="SqlTriggerParameterDescriptor"/> </returns>
