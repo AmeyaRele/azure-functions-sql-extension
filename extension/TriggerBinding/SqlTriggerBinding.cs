@@ -21,7 +21,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     /// Represents the SQL trigger binding for a given user table being monitored for changes
     /// </summary>
     /// <typeparam name="T">A user-defined POCO that represents a row of the user's table</typeparam>
-    internal class SqlTriggerBinding<T> : ITriggerBinding
+    internal sealed class SqlTriggerBinding<T> : ITriggerBinding
     {
         private readonly string _connectionString;
         private readonly string _table;

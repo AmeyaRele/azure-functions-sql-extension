@@ -7,7 +7,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     /// Represents a row that was changed in the user's table as well as metadata related to that change.
     /// If the row was deleted, then <see cref="Data"/> is populated only with the primary key values of the deleted row
     /// <typeparam name="T">A user-defined POCO that represents a row of the table</typeparam>
-    public class SqlChangeTrackingEntry<T>
+    public sealed class SqlChangeTrackingEntry<T>
     {
         /// <summary>
         /// Initializes a new instance of the <see cref="SqlChangeTrackingEntry<typeparamref name="T"/>"/> class.
