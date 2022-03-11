@@ -13,7 +13,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     internal class SqlTriggerListener<T> : IListener
     {
 
-        private readonly SqlTableWatchers.SqlTableChangeMonitor<T> _watcher;
+        private readonly SqlTableChangeMonitor<T> _changeMonitor;
         private State _state;
 
         /// <summary>
@@ -33,7 +33,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// </param>
         public SqlTriggerListener(string table, string connectionString, string workerId, ITriggeredFunctionExecutor executor, ILogger logger)
         {
-            _watcher = new SqlTableWatchers.SqlTableChangeMonitor<T>(table, connectionString, workerId, executor, logger);
+            _changeMonitor = new SqlTableChangeMonitor<T>(table, connectionString, workerId, executor, logger);
             _state = State.NotInitialized;
         }
 
@@ -61,7 +61,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             if (_state == State.NotInitialized)
             {
-                await _watcher.StartAsync();
+                await _changeMonitor.StartAsync();
                 _state = State.Running;
             }
         }
@@ -72,10 +72,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="cancellationToken">Unused</param>
         public Task StopAsync(CancellationToken cancellationToken)
         {
-            // Nothing to stop if the watcher has either already been stopped or hasn't been started
+            // Nothing to stop if the change monitor has either already been stopped or hasn't been started
             if (_state == State.Running)
             {
-                _watcher.Stop();
+                _changeMonitor.Stop();
                 _state = State.Stopped;
             }
             return Task.CompletedTask;

@@ -71,7 +71,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
             if (attribute == null)
             {
-                return Task.FromResult<ITriggerBinding>(null);
+                return Task.FromResult(default(ITriggerBinding));
             }
 
             if (!IsValidType(parameter.ParameterType))
@@ -83,7 +83,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             Type type = parameter.ParameterType.GetGenericArguments()[0].GetGenericArguments()[0];
             Type typeOfTriggerBinding = typeof(SqlTriggerBinding<>).MakeGenericType(type);
             ConstructorInfo constructor = typeOfTriggerBinding.GetConstructor(new Type[] { typeof(string), typeof(string), typeof(ParameterInfo), typeof(IHostIdProvider), typeof(ILogger) });
-            return Task.FromResult<ITriggerBinding>((ITriggerBinding)constructor.Invoke(new object[] {attribute.TableName,
+            return Task.FromResult((ITriggerBinding)constructor.Invoke(new object[] {attribute.TableName,
                 SqlBindingUtilities.GetConnectionString(attribute.ConnectionStringSetting, _configuration), parameter, _hostIdProvider, _logger }));
         }
 
