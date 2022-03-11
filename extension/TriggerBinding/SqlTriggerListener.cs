@@ -10,7 +10,7 @@ using Microsoft.Extensions.Logging;
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
     /// <typeparam name="T">A user-defined POCO that represents a row of the user's table</typeparam>
-    internal class SqlTriggerListener<T> : IListener
+    internal sealed class SqlTriggerListener<T> : IListener
     {
 
         private readonly SqlTableChangeMonitor<T> _changeMonitor;

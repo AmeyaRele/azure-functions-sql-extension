@@ -21,7 +21,7 @@ using Newtonsoft.Json.Serialization;
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
     /// <typeparam name="T">A user-defined POCO that represents a row of the user's table</typeparam>
-    internal class SqlAsyncCollector<T> : IAsyncCollector<T>
+    internal sealed class SqlAsyncCollector<T> : IAsyncCollector<T>
     {
         private readonly static string RowDataParameter = "@rowData";
         private readonly static string ColumnName = "COLUMN_NAME";

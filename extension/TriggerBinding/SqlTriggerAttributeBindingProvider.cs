@@ -13,7 +13,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
-    internal class SqlTriggerAttributeBindingProvider : ITriggerBindingProvider
+    internal sealed class SqlTriggerAttributeBindingProvider : ITriggerBindingProvider
     {
         private readonly IConfiguration _configuration;
         private readonly IHostIdProvider _hostIdProvider;

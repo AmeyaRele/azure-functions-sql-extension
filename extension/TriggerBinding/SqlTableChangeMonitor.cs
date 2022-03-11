@@ -24,10 +24,14 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     /// data stored in SQL's internal change table, or data stored in our own worker table.
     /// </remarks>
     /// <typeparam name="T">A user-defined POCO that represents a row of the user's table</typeparam>
-    public class SqlTableChangeMonitor<T>
+    internal sealed class SqlTableChangeMonitor<T>
     {
         public const string Schema = "az_func";
         public const int BatchSize = 10;
+        public const int MaxDequeueCount = 5;
+        public const int MaxLeaseRenewalCount = 5;
+        public const int LeaseIntervalInSeconds = 30;
+        public const int PollingIntervalInSeconds = 5;
 
         private static string[] variableLengthTypes = new string[] { "varchar", "nvarchar", "nchar", "char", "binary", "varbinary" };
         private static string[] variablePrecisionTypes = new string[] { "numeric", "decimal" };
@@ -132,7 +136,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         }
 
         /// <summary>
-        /// Executed once every <see cref="SqlTriggerConstants.LeaseTime"/> period. 
+        /// Executed once every <see cref="LeaseTime"/> period. 
         /// If the state of the change monitor is <see cref="State.ProcessingChanges"/>, then 
         /// we will renew the leases held by the change monitor on "_rows"
         /// </summary>
@@ -170,7 +174,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                             _leaseRenewalCount++;
                             // If this thread has been cancelled, then the _cancellationTokenSourceExecutor could have already been disposed so
                             // shouldn't cancel it
-                            if (_leaseRenewalCount == SqlTriggerConstants.MaxLeaseRenewalCount && !token.IsCancellationRequested)
+                            if (_leaseRenewalCount == MaxLeaseRenewalCount && !token.IsCancellationRequested)
                             {
                                 // If we keep renewing the leases, the thread responsible for processing the changes is stuck
                                 // If it's stuck, it has to be stuck in the function execution call (I think), so we should cancel the call
@@ -184,7 +188,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                         _rowsLock.Release();
                     }
                     // Want to make sure to renew the leases before they expire, so we renew them twice per lease period
-                    await Task.Delay(SqlTriggerConstants.LeaseInterval / 2 * 1000, token);
+                    await Task.Delay(TimeSpan.FromSeconds(LeaseIntervalInSeconds / 2), token);
                 }
             }
             catch (Exception e)
@@ -203,7 +207,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         }
 
         /// <summary>
-        /// Executed once every <see cref="SqlTriggerConstants.PollingInterval"/> period. If the state of the change monitor is <see cref="State.CheckingForChanges"/>, then 
+        /// Executed once every <see cref="PollingIntervalInSeconds"/> period. If the state of the change monitor is <see cref="State.CheckingForChanges"/>, then 
         /// the method query the change/worker tables for changes on the user's table. If any are found, the state of the change monitor is
         /// transitioned to <see cref="State.ProcessingChanges"/> and the user's function is executed with the found changes. 
         /// If execution is successful, the leases on "_rows" are released and the state transitions to <see cref="State.CheckingForChanges"/>
@@ -258,7 +262,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                         }
                     }
                     // The Delay will exit if the token is cancelled
-                    await Task.Delay(SqlTriggerConstants.PollingInterval * 1000, token);
+                    await Task.Delay(TimeSpan.FromSeconds(PollingIntervalInSeconds), token);
                 }
             }
             catch (Exception e)
@@ -601,7 +605,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 $"WHERE (Changes.LeaseExpirationTime IS NULL AND\n" +
                 $"(Changes.VersionNumber IS NULL OR Changes.VersionNumber < Changes.SYS_CHANGE_VERSION)\n" +
                 $"OR Changes.LeaseExpirationTime < SYSDATETIME())\n" +
-                $"AND (Changes.DequeueCount IS NULL OR Changes.DequeueCount < {SqlTriggerConstants.MaxDequeueCount})\n" +
+                $"AND (Changes.DequeueCount IS NULL OR Changes.DequeueCount < {MaxDequeueCount})\n" +
                 $"ORDER BY Changes.SYS_CHANGE_VERSION ASC;\n";
 
             return new SqlCommand(getChangesQuery, connection, transaction);
@@ -630,10 +634,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 acquireLeasesCommandString +=
                     $"IF NOT EXISTS (SELECT * FROM {_workerTable} WHERE {whereCheck})\n" +
                     $"INSERT INTO {_workerTable}\n" +
-                    $"VALUES ({valuesList}, DATEADD({SqlTriggerConstants.LeaseUnits}, {SqlTriggerConstants.LeaseInterval}, SYSDATETIME()), 0, {versionNumber})\n" +
+                    $"VALUES ({valuesList}, DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()), 0, {versionNumber})\n" +
                     $"ELSE\n" +
                     $"UPDATE {_workerTable}\n" +
-                    $"SET LeaseExpirationTime = DATEADD({SqlTriggerConstants.LeaseUnits}, {SqlTriggerConstants.LeaseInterval}, SYSDATETIME()), DequeueCount = DequeueCount + 1, " +
+                    $"SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()), DequeueCount = DequeueCount + 1, " +
                     $"VersionNumber = {versionNumber}\n" +
                     $"WHERE {whereCheck};\n";
 
@@ -662,7 +666,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             {
                 renewLeasesCommandString +=
                 $"UPDATE {_workerTable}\n" +
-                $"SET LeaseExpirationTime = DATEADD({SqlTriggerConstants.LeaseUnits}, {SqlTriggerConstants.LeaseInterval}, SYSDATETIME())\n" +
+                $"SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME())\n" +
                 $"WHERE {_whereChecks.ElementAt(index++)};\n";
             }
 
@@ -801,7 +805,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 $"LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}\n" +
                 $"WHERE c.SYS_CHANGE_VERSION <= {newVersionNumber}\n" +
                 $"AND ((w.VersionNumber IS NULL OR w.VersionNumber != c.SYS_CHANGE_VERSION OR w.LeaseExpirationTime IS NOT NULL)\n" +
-                $"AND (w.DequeueCount IS NULL OR w.DequeueCount < {SqlTriggerConstants.MaxDequeueCount}))) AS Changes;\n" +
+                $"AND (w.DequeueCount IS NULL OR w.DequeueCount < {MaxDequeueCount}))) AS Changes;\n" +
                 $"IF @unprocessed_changes = 0 AND {newVersionNumber} > @current_version\n" +
                 $"BEGIN\n" +
                 $"UPDATE {_globalStateTable}\n" +
@@ -998,7 +1002,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             }
         }
 
-        enum State
+        private enum State
         {
             CheckingForChanges,
             ProcessingChanges

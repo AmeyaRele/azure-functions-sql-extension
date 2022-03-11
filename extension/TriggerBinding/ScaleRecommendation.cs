@@ -8,7 +8,7 @@ namespace SqlBinding.TriggerBinding
     /// <summary>
     /// Represents a scale recommendation given the current metrics for changes occurring to a SQL table
     /// </summary>
-    public class ScaleRecommendation : EventArgs
+    internal sealed class ScaleRecommendation : EventArgs
     {
         internal ScaleRecommendation(ScaleAction scaleAction, bool keepWorkersAlive, string reason)
         {
