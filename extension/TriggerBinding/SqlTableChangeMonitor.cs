@@ -571,15 +571,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildUpdateGlobalVersionNumberCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var updateGlobalStateTableCommand =
-                $"DECLARE @min_version bigint;\n" +
-                $"DECLARE @current_version bigint;\n" +
-                $"SET @min_version = CHANGE_TRACKING_MIN_VALID_VERSION({_userTableId});\n" +
-                $"SELECT @current_version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId};\n" +
-                $"IF @current_version < @min_version\n" +
-                $"UPDATE {_globalStateTable}\n" +
-                $"SET GlobalVersionNumber = @min_version\n" +
-                $"WHERE UserTableID = {_userTableId};";
+            string updateGlobalStateTableCommand = $@"
+                DECLARE @min_version bigint;
+                DECLARE @current_version bigint;
+                SET @min_version = CHANGE_TRACKING_MIN_VALID_VERSION({_userTableId});
+                SELECT @current_version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
+
+                IF @current_version < @min_version
+                    UPDATE {_globalStateTable} SET GlobalVersionNumber = @min_version WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
+            ";
 
             return new SqlCommand(updateGlobalStateTableCommand, connection, transaction);
         }
@@ -592,21 +592,23 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildCheckForChangesCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var getChangesQuery =
-                $"DECLARE @version bigint;\n" +
-                $"SELECT @version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId};\n" +
-                $"SELECT TOP {BatchSize} *\n" +
-                $"FROM\n" +
-                $"(SELECT {_primaryKeysSelectList}, {_userTableColumnsSelectList}c.SYS_CHANGE_VERSION, c.SYS_CHANGE_CREATION_VERSION, c.SYS_CHANGE_OPERATION, \n" +
-                $"c.SYS_CHANGE_COLUMNS, c.SYS_CHANGE_CONTEXT, w.LeaseExpirationTime, w.DequeueCount, w.VersionNumber\n" +
-                $"FROM CHANGETABLE (CHANGES {_userTable}, @version) AS c\n" +
-                $"LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}\n" +
-                $"LEFT OUTER JOIN {_userTable} AS u ON {_leftOuterJoinUserTable}) AS CHANGES\n" +
-                $"WHERE (Changes.LeaseExpirationTime IS NULL AND\n" +
-                $"(Changes.VersionNumber IS NULL OR Changes.VersionNumber < Changes.SYS_CHANGE_VERSION)\n" +
-                $"OR Changes.LeaseExpirationTime < SYSDATETIME())\n" +
-                $"AND (Changes.DequeueCount IS NULL OR Changes.DequeueCount < {MaxDequeueCount})\n" +
-                $"ORDER BY Changes.SYS_CHANGE_VERSION ASC;\n";
+            string getChangesQuery = $@"
+                DECLARE @version bigint;
+                SELECT @version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
+                SELECT TOP {BatchSize} * FROM
+                    (SELECT {_primaryKeysSelectList}, {_userTableColumnsSelectList}
+                        c.SYS_CHANGE_VERSION, c.SYS_CHANGE_CREATION_VERSION, c.SYS_CHANGE_OPERATION, c.SYS_CHANGE_COLUMNS, c.SYS_CHANGE_CONTEXT,
+                        w.LeaseExpirationTime, w.DequeueCount, w.VersionNumber
+                    FROM CHANGETABLE (CHANGES {_userTable}, @version) AS c
+                    LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}
+                    LEFT OUTER JOIN {_userTable} AS u ON {_leftOuterJoinUserTable}) AS Changes
+                WHERE
+                    (Changes.LeaseExpirationTime IS NULL
+                        AND (Changes.VersionNumber IS NULL OR Changes.VersionNumber < Changes.SYS_CHANGE_VERSION)
+                        OR Changes.LeaseExpirationTime < SYSDATETIME())
+                    AND (Changes.DequeueCount IS NULL OR Changes.DequeueCount < {MaxDequeueCount})
+                ORDER BY Changes.SYS_CHANGE_VERSION ASC;
+            ";
 
             return new SqlCommand(getChangesQuery, connection, transaction);
         }
@@ -744,7 +746,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildCreateSchemaCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var createSchemaCommand =
+            string createSchemaCommand =
                 $"IF SCHEMA_ID(N\'{Schema}\') IS NULL\n" +
                 $"EXEC (\'CREATE SCHEMA {Schema}\')";
 
@@ -759,12 +761,16 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildCreateGlobalStateTableCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var createGlobalStateTableCommand =
-                $"IF OBJECT_ID(N\'{_globalStateTable}\', \'U\') IS NULL\n" +
-                $"CREATE TABLE {_globalStateTable} (\n" +
-                $"UserTableID int PRIMARY KEY,\n" +
-                $"GlobalVersionNumber bigint NOT NULL\n" +
-                $");";
+            string createGlobalStateTableCommand = $@"
+                IF OBJECT_ID(N'{_globalStateTable}', N'U') IS NULL
+                    CREATE TABLE {_globalStateTable} (
+                        UserTableID int,
+                        WorkerID char(80),
+                        GlobalVersionNumber bigint NOT NULL,
+                        PRIMARY KEY (UserTableID, WorkerID)
+                    );
+            ";
+
             return new SqlCommand(createGlobalStateTableCommand, connection, transaction);
         }
 
@@ -776,10 +782,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildInsertRowGlobalStateTableCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var insertRowGlobalStateTableCommand =
-                $"IF NOT EXISTS (SELECT * FROM {_globalStateTable} WHERE UserTableID = {_userTableId})\n" +
-                $"INSERT INTO {_globalStateTable}\n" +
-                $"VALUES ({_userTableId}, CHANGE_TRACKING_MIN_VALID_VERSION({_userTableId}));\n";
+            string insertRowGlobalStateTableCommand = $@"
+                IF NOT EXISTS (SELECT * FROM {_globalStateTable} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}')
+                    INSERT INTO {_globalStateTable}
+                    VALUES ({_userTableId}, '{_workerId}', CHANGE_TRACKING_MIN_VALID_VERSION({_userTableId}));
+            ";
 
             return new SqlCommand(insertRowGlobalStateTableCommand, connection, transaction);
         }
@@ -794,26 +801,24 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildUpdateGlobalStateTableCommand(SqlConnection connection, SqlTransaction transaction, long newVersionNumber, long rowsProcessed)
         {
-            var updateGlobalStateTableCommand =
-                $"DECLARE @current_version bigint;\n" +
-                $"DECLARE @unprocessed_changes bigint;\n" +
-                $"SELECT @current_version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId};\n" +
-                $"SELECT @unprocessed_changes = \n" +
-                $"COUNT(*)\n" +
-                $"FROM\n" +
-                $"(SELECT c.SYS_CHANGE_VERSION FROM CHANGETABLE(CHANGES {_userTable}, @current_version) AS c\n" +
-                $"LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}\n" +
-                $"WHERE c.SYS_CHANGE_VERSION <= {newVersionNumber}\n" +
-                $"AND ((w.VersionNumber IS NULL OR w.VersionNumber != c.SYS_CHANGE_VERSION OR w.LeaseExpirationTime IS NOT NULL)\n" +
-                $"AND (w.DequeueCount IS NULL OR w.DequeueCount < {MaxDequeueCount}))) AS Changes;\n" +
-                $"IF @unprocessed_changes = 0 AND {newVersionNumber} > @current_version\n" +
-                $"BEGIN\n" +
-                $"UPDATE {_globalStateTable}\n" +
-                $"SET GlobalVersionNumber = {newVersionNumber}\n" +
-                $"WHERE UserTableID = {_userTableId};\n" +
-                $"DELETE FROM {_workerTable}\n" +
-                $"WHERE VersionNumber <= {newVersionNumber};\n" +
-                $"END\n";
+            string updateGlobalStateTableCommand = $@"
+                DECLARE @current_version bigint;
+                DECLARE @unprocessed_changes bigint;
+                SELECT @current_version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
+
+                SELECT @unprocessed_changes = COUNT(*) FROM
+                    (SELECT c.SYS_CHANGE_VERSION FROM CHANGETABLE(CHANGES {_userTable}, @current_version) AS c
+                    LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}
+                    WHERE c.SYS_CHANGE_VERSION <= {newVersionNumber}
+                    AND ((w.VersionNumber IS NULL OR w.VersionNumber != c.SYS_CHANGE_VERSION OR w.LeaseExpirationTime IS NOT NULL)
+                    AND (w.DequeueCount IS NULL OR w.DequeueCount < {MaxDequeueCount}))) AS Changes;
+
+                IF @unprocessed_changes = 0 AND {newVersionNumber} > @current_version
+                BEGIN
+                    UPDATE {_globalStateTable} SET GlobalVersionNumber = {newVersionNumber} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
+                    DELETE FROM {_workerTable} WHERE VersionNumber <= {newVersionNumber};
+                END
+            ";
 
             return new SqlCommand(updateGlobalStateTableCommand, connection, transaction);
         }
