@@ -293,7 +293,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         private async Task CreateWorkerTablesAsync()
         {
             await GetUserTableSchemaAsync();
-            _workerTable = $"[{Schema}].[Worker_Table_{_userTableId}]";
+            _workerTable = $"[{Schema}].[Worker_Table_{_userTableId}_{_workerId}]";
 
             using (var connection = new SqlConnection(_connectionString))
             {
@@ -345,7 +345,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// Retrieves the primary keys of the user's table and stores them in the _primaryKeys dictionary,
         /// which maps from primary key name to primary key type
         /// Also retrieves the column names of the user's table and stores them in _userTableColumns,
-        /// as well as the user table's OBJECT_ID which it stores to _userTableID
+        /// as well as the user table's OBJECT_ID which it stores to _userTableId
         /// </summary>
         /// <exception cref="InvalidOperationException">
         /// Thrown if the query to retrieve the OBJECT_ID of the user table fails to correctly execute
@@ -378,7 +378,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                         }
                     }
                 }
-                
+
                 InitializeQueryStrings();
             }
             _userTableId = await GetUserTableIDAsync(_connectionString, _userTable);
