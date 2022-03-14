@@ -8,7 +8,7 @@ namespace SqlExample
     public static class SqlExample
     {
         public static void Run(
-            [SqlTrigger("[SqlExtension].[Employees]", ConnectionStringSetting = "SqlConnectionString")]
+            [SqlTrigger("[dbo].[Employees]", ConnectionStringSetting = "SqlConnectionString")]
             IEnumerable<SqlChangeTrackingEntry<Employee>> changes,
             ILogger logger)
         {

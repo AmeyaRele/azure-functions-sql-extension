@@ -139,12 +139,9 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             string hostId = await _hostIdProvider.GetHostIdAsync(CancellationToken.None);
 
-            using var md5 = MD5.Create();
             var methodInfo = (MethodInfo)_parameter.Member;
             string functionName = $"{methodInfo.DeclaringType.FullName}.{methodInfo.Name}";
-            byte[] functionHash = md5.ComputeHash(Encoding.UTF8.GetBytes(functionName));
-            string functionId = new Guid(functionHash).ToString("N").Substring(0, 8);
-
+            string functionId = functionName.Length > 10 ? functionName.Substring(0,10) : functionName;
             return $"{hostId}_{functionId}";
         }
 
