@@ -415,7 +415,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                                     _rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader, cols));
                                 }
                             }
-                        }
+                        }  
 
                         // If changes were found, acquire leases on them
                         if (_rows.Count != 0)
@@ -501,14 +501,14 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                         using (SqlCommand releaseLeaseCommand = BuildReleaseLeasesCommand(connection, transaction))
                         {
                             await releaseLeaseCommand.ExecuteNonQueryAsync();
-                        }
+                        }         
 
                         // Update the global state table if we have processed all changes with version number <= newVersionNumber, and clean up the worker table
                         // to remove all rows with VersionNumber <= newVersionNumber
                         using (SqlCommand updateGlobalStateTableCommand = BuildUpdateGlobalStateTableCommand(connection, transaction, newVersionNumber, _rows.Count))
                         {
                             await updateGlobalStateTableCommand.ExecuteNonQueryAsync();
-                        }
+                        }               
                         await transaction.CommitAsync();
                     }
                 }
@@ -576,7 +576,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 DECLARE @current_version bigint;
                 SET @min_version = CHANGE_TRACKING_MIN_VALID_VERSION({_userTableId});
                 SELECT @current_version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
-
+                
                 IF @current_version < @min_version
                     UPDATE {_globalStateTable} SET GlobalVersionNumber = @min_version WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
             ";
@@ -597,10 +597,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 SELECT @version = GlobalVersionNumber FROM {_globalStateTable} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
                 SELECT TOP {BatchSize} * FROM
                     (SELECT {_primaryKeysSelectList}, {_userTableColumnsSelectList}
-                        c.SYS_CHANGE_VERSION, c.SYS_CHANGE_CREATION_VERSION, c.SYS_CHANGE_OPERATION, c.SYS_CHANGE_COLUMNS, c.SYS_CHANGE_CONTEXT,
-                        w.LeaseExpirationTime, w.DequeueCount, w.VersionNumber
+                        c.SYS_CHANGE_VERSION, c.SYS_CHANGE_OPERATION,
+                        w.VersionNumber, w.DequeueCount, w.LeaseExpirationTime
                     FROM CHANGETABLE (CHANGES {_userTable}, @version) AS c
-                    LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}
+                    LEFT OUTER JOIN {_workerTable} AS w with (TABLOCKX) ON {_leftOuterJoinWorkerTable}
                     LEFT OUTER JOIN {_userTable} AS u ON {_leftOuterJoinUserTable}) AS Changes
                 WHERE
                     (Changes.LeaseExpirationTime IS NULL
@@ -634,11 +634,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
                 row.TryGetValue("SYS_CHANGE_VERSION", out string versionNumber);
                 acquireLeasesCommandString +=
-                    $"IF NOT EXISTS (SELECT * FROM {_workerTable} WHERE {whereCheck})\n" +
-                    $"INSERT INTO {_workerTable}\n" +
+                    $"IF NOT EXISTS (SELECT * FROM {_workerTable} with (TABLOCKX) WHERE {whereCheck})\n" +
+                    $"INSERT INTO {_workerTable} with (TABLOCKX)\n" +
                     $"VALUES ({valuesList}, DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()), 0, {versionNumber})\n" +
                     $"ELSE\n" +
-                    $"UPDATE {_workerTable}\n" +
+                    $"UPDATE {_workerTable} with (TABLOCKX)\n" +
                     $"SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()), DequeueCount = DequeueCount + 1, " +
                     $"VersionNumber = {versionNumber}\n" +
                     $"WHERE {whereCheck};\n";
@@ -667,7 +667,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             foreach (var row in _rows)
             {
                 renewLeasesCommandString +=
-                $"UPDATE {_workerTable}\n" +
+                $"UPDATE {_workerTable} with (TABLOCKX)\n" +
                 $"SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME())\n" +
                 $"WHERE {_whereChecks.ElementAt(index++)};\n";
             }
@@ -698,10 +698,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
                 releaseLeasesCommandString +=
                     $"SELECT @current_version = VersionNumber\n" +
-                    $"FROM {_workerTable}\n" +
+                    $"FROM {_workerTable} with (TABLOCKX) \n" +
                     $"WHERE {whereCheck};\n" +
                     $"IF {versionNumber} >= @current_version\n" +
-                    $"UPDATE {_workerTable}\n" +
+                    $"UPDATE {_workerTable} with (TABLOCKX) \n" +
                     $"SET LeaseExpirationTime = NULL, DequeueCount = 0, VersionNumber = {versionNumber}\n" +
                     $"WHERE {whereCheck};\n";
             }
@@ -808,7 +808,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
                 SELECT @unprocessed_changes = COUNT(*) FROM
                     (SELECT c.SYS_CHANGE_VERSION FROM CHANGETABLE(CHANGES {_userTable}, @current_version) AS c
-                    LEFT OUTER JOIN {_workerTable} AS w ON {_leftOuterJoinWorkerTable}
+                    LEFT OUTER JOIN {_workerTable} AS w with (TABLOCKX) ON {_leftOuterJoinWorkerTable}
                     WHERE c.SYS_CHANGE_VERSION <= {newVersionNumber}
                     AND ((w.VersionNumber IS NULL OR w.VersionNumber != c.SYS_CHANGE_VERSION OR w.LeaseExpirationTime IS NOT NULL)
                     AND (w.DequeueCount IS NULL OR w.DequeueCount < {MaxDequeueCount}))) AS Changes;
@@ -816,7 +816,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 IF @unprocessed_changes = 0 AND {newVersionNumber} > @current_version
                 BEGIN
                     UPDATE {_globalStateTable} SET GlobalVersionNumber = {newVersionNumber} WHERE UserTableID = {_userTableId} AND WorkerID = '{_workerId}';
-                    DELETE FROM {_workerTable} WHERE VersionNumber <= {newVersionNumber};
+                    DELETE FROM {_workerTable} with (TABLOCKX) WHERE VersionNumber <= {newVersionNumber};
                 END
             ";
 
