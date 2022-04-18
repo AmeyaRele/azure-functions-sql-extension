@@ -7,7 +7,7 @@ using Microsoft.Azure.WebJobs.Host.Protocols;
 
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
-    internal class SqlTriggerParameterDescriptor : TriggerParameterDescriptor
+    internal sealed class SqlTriggerParameterDescriptor : TriggerParameterDescriptor
     {
         /// <summary>
         /// Name of the table being monitored

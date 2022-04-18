@@ -12,7 +12,7 @@ using Newtonsoft.Json;
 
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
-    internal class SqlConverters
+    internal sealed class SqlConverters
     {
         internal class SqlConverter : IConverter<SqlAttribute, SqlCommand>
         {

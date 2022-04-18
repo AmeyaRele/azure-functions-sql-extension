@@ -10,14 +10,14 @@ using Microsoft.Extensions.Logging;
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
     /// <typeparam name="T">A user-defined POCO that represents a row of the user's table</typeparam>
-    internal class SqlTriggerListener<T> : IListener
+    internal sealed class SqlTriggerListener<T> : IListener
     {
 
-        private readonly SqlTableWatchers.SqlTableChangeMonitor<T> _watcher;
+        private readonly SqlTableChangeMonitor<T> _changeMonitor;
         private State _state;
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="SqlTriggerListener<typeparamref name="T"/>>
+        /// Initializes a new instance of the <see cref="SqlTriggerListener{T}" />>
         /// </summary>
         /// <param name="connectionString">
         /// The SQL connection string used to connect to the user's database
@@ -25,12 +25,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="table"> 
         /// The name of the user table that changes are being tracked on
         /// </param>
+        /// <param name="workerId">
+        /// The worker application ID
+        /// </param>
         /// <param name="executor">
         /// Used to execute the user's function when changes are detected on "table"
         /// </param>
-        public SqlTriggerListener(string table, string connectionString, ITriggeredFunctionExecutor executor, ILogger logger)
+        public SqlTriggerListener(string table, string connectionString, string workerId, ITriggeredFunctionExecutor executor, ILogger logger)
         {
-            _watcher = new SqlTableWatchers.SqlTableChangeMonitor<T>(table, connectionString, executor, logger);
+            _changeMonitor = new SqlTableChangeMonitor<T>(table, connectionString, workerId, executor, logger);
             _state = State.NotInitialized;
         }
 
@@ -58,7 +61,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             if (_state == State.NotInitialized)
             {
-                await _watcher.StartAsync();
+                await _changeMonitor.StartAsync();
                 _state = State.Running;
             }
         }
@@ -69,10 +72,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <param name="cancellationToken">Unused</param>
         public Task StopAsync(CancellationToken cancellationToken)
         {
-            // Nothing to stop if the watcher has either already been stopped or hasn't been started
+            // Nothing to stop if the change monitor has either already been stopped or hasn't been started
             if (_state == State.Running)
             {
-                _watcher.Stop();
+                _changeMonitor.Stop();
                 _state = State.Stopped;
             }
             return Task.CompletedTask;
