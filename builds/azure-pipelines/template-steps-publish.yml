@@ -2,21 +2,20 @@ parameters:
   configuration: ''
 
 steps:
-# .NET Core 2.1 for CodeSign
 - task: UseDotNet@2
-  displayName: 'Install .NET Core SDK 2.1.x for CodeSign'
+  displayName: 'Install .NET Core SDK 5.0.x for CodeSign'
   inputs:
-    version: '2.1.x'
+    version: '5.0.x'
 
 - task: EsrpCodeSigning@1
-  displayName: 'Nuget Code Signing'
+  displayName: 'ESRP Code Signing - Nuget Package'
   inputs:
     ConnectedServiceName: 'Code Signing'
     FolderPath: '$(Build.ArtifactStagingDirectory)'
     Pattern: '*.nupkg'
     signConfigType: 'inlineSignParams'
     inlineOperation: |
-      [ 
+      [
           {
               "keyCode": "CP-401405",
               "operationSetCode": "NuGetSign",
@@ -36,14 +35,15 @@ steps:
     MaxConcurrency: '50'
     MaxRetryAttempts: '5'
 
+- task: AzureArtifacts.manifest-generator-task.manifest-generator-task.ManifestGeneratorTask@0
+  displayName: 'SBOM Generation Task'
+  inputs:
+      BuildDropPath: '$(Build.ArtifactStagingDirectory)'
+      PackageName: 'Azure SQL bindings for Azure Functions'
+      PackageVersion: '$(nugetVersion)'
+
 - task: PublishPipelineArtifact@1
   displayName: 'Publish Pipeline Artifact'
   inputs:
-    targetPath: '$(Build.ArtifactStagingDirectory)' 
+    targetPath: '$(Build.ArtifactStagingDirectory)'
     artifactName: 'drop'
-
-- task: PublishCodeCoverageResults@1
-  displayName: 'Publish Code Coverage Results'
-  inputs:
-    codeCoverageTool: Cobertura
-    summaryFileLocation: '$(Build.ArtifactStagingDirectory)\TestResults\coverage\coverage.cobertura.xml'
