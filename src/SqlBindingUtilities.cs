@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Linq;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 
@@ -135,58 +136,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <summary>
         /// Returns a dictionary where each key is a column name and each value is the SQL row's value for that column
         /// </summary>
-        /// <param name="reader">
-        /// Used to determine the columns of the table as well as the next SQL row to process
-        /// </param>
-        /// <param name="cols">
-        /// Filled with the columns of the table if empty, otherwise assumed to be populated
-        /// with their names already (used for cacheing so we don't retrieve the column names every time)
-        /// </param>
+        /// <param name="reader">Used to determine the columns of the table as well as the next SQL row to process</param>
         /// <returns>The built dictionary</returns>
-        public static Dictionary<string, string> BuildDictionaryFromSqlRow(SqlDataReader reader, List<string> cols)
+        public static IReadOnlyDictionary<string, string> BuildDictionaryFromSqlRow(SqlDataReader reader)
         {
-            if (cols.Count == 0)
-            {
-                for (int i = 0; i < reader.FieldCount; i++)
-                {
-                    cols.Add(reader.GetName(i));
-                }
-            }
-
-            var result = new Dictionary<string, string>();
-            foreach (string col in cols)
-            {
-                result.Add(col, reader[col].ToString());
-            }
-            return result;
-        }
-
-        /// <summary>
-        /// Attaches SqlParameters to "command". Each parameter follows the format (@PrimaryKey_i, PrimaryKeyValue), where @PrimaryKey is the
-        /// name of a primary key column, and PrimaryKeyValue is one of the row's value for that column. To distinguish between the parameters
-        /// of different rows, each row will have a distinct value of i.
-        /// </summary>
-        /// <param name="command">The command the parameters are attached to</param>
-        /// <param name="rows">The rows to which this command corresponds to</param>
-        /// <param name="primaryKeys">List of primary key column names</param>
-        /// <remarks>
-        /// Ideally, we would have a map that maps from rows to a list of SqlCommands populated with their primary key values. The issue with
-        /// this is that SQL doesn't seem to allow adding parameters to one collection when they are part of another. So, for example, since
-        /// the SqlParameters are part of the list in the map, an exception is thrown if they are also added to the collection of a SqlCommand.
-        /// The expected behavior seems to be to rebuild the SqlParameters each time
-        /// </remarks>
-        public static void AddPrimaryKeyParametersToCommand(SqlCommand command, List<Dictionary<string, string>> rows, IEnumerable<string> primaryKeys)
-        {
-            int index = 0;
-            foreach (Dictionary<string, string> row in rows)
-            {
-                foreach (string key in primaryKeys)
-                {
-                    row.TryGetValue(key, out string primaryKeyValue);
-                    command.Parameters.Add(new SqlParameter($"@{key}_{index}", primaryKeyValue));
-                }
-                index++;
-            }
+            return Enumerable.Range(0, reader.FieldCount).ToDictionary(reader.GetName, i => reader.GetValue(i).ToString());
         }
 
         /// <summary>

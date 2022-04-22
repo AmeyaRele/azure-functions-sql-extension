@@ -12,192 +12,299 @@ using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using System.Text;
 
 namespace Microsoft.Azure.WebJobs.Extensions.Sql
 {
     /// <summary>
-    /// Periodically polls SQL's change table to determine if any new changes have occurred to a user's table
+    /// Periodically polls SQL's change table to determine if any new changes have occurred to a user's table.
     /// </summary>
     /// <remarks>
-    /// Note that there is no possiblity of SQL injection in the raw queries we generate in the Build...Command methods.
-    /// All parameters that involve inserting data from a user table are sanitized
-    /// All other parameters are generated exclusively using information about the user table's schema (such as primary key column names),
-    /// data stored in SQL's internal change table, or data stored in our own worker table.
+    /// Note that there is no possiblity of SQL injection in the raw queries we generate. All parameters that involve
+    /// inserting data from a user table are sanitized. All other parameters are generated exclusively using information
+    /// about the user table's schema (such as primary key column names), data stored in SQL's internal change table, or
+    /// data stored in our own worker table.
     /// </remarks>
     /// <typeparam name="T">A user-defined POCO that represents a row of the user's table</typeparam>
     internal sealed class SqlTableChangeMonitor<T> : IDisposable
     {
-        public const string Schema = "az_func";
         public const int BatchSize = 10;
-        public const int MaxDequeueCount = 5;
+        public const int MaxAttemptCount = 5;
         public const int MaxLeaseRenewalCount = 5;
         public const int LeaseIntervalInSeconds = 30;
         public const int PollingIntervalInSeconds = 5;
 
-        private readonly string[] variableLengthTypes = new string[] { "varchar", "nvarchar", "nchar", "char", "binary", "varbinary" };
-        private readonly string[] variablePrecisionTypes = new string[] { "numeric", "decimal" };
-
-        private readonly string _workerId;
-        private readonly string _globalStateTable;
-        private readonly string _userTable;
         private readonly string _connectionString;
+        private readonly int _userTableId;
+        private readonly string _userTableName;
+        private readonly string _userFunctionId;
+        private readonly string _workerTableName;
+        private readonly IReadOnlyList<string> _userTableColumns;
+        private readonly IReadOnlyList<string> _primaryKeyColumns;
+        private readonly IReadOnlyList<string> _rowMatchConditions;
         private readonly ITriggeredFunctionExecutor _executor;
         private readonly ILogger _logger;
-        private CancellationTokenSource _cancellationTokenSourceExecutor;
+
         private readonly CancellationTokenSource _cancellationTokenSourceCheckForChanges;
         private readonly CancellationTokenSource _cancellationTokenSourceRenewLeases;
+        private CancellationTokenSource _cancellationTokenSourceExecutor;
 
-        // It should be impossible for multiple threads to access these at the same time because of the semaphore we use
-        private readonly List<Dictionary<string, string>> _rows;
-        private readonly List<string> _userTableColumns;
-        private readonly List<string> _whereChecks;
-        private readonly Dictionary<string, string> _primaryKeys;
-
+        // It should be impossible for multiple threads to access these at the same time because of the semaphore we use.
         private readonly SemaphoreSlim _rowsLock;
-        private State _state;
+        private IReadOnlyList<IReadOnlyDictionary<string, string>> _rows;
         private int _leaseRenewalCount;
+        private State _state = State.CheckingForChanges;
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="SqlTableChangeMonitor{T}" />> class
+        /// Initializes a new instance of the <see cref="SqlTableChangeMonitor{T}" />> class.
         /// </summary>
-        /// <param name="connectionString">
-        /// The SQL connection string used to connect to the user's database
-        /// </param>
-        /// <param name="table"> 
-        /// The name of the user table that changes are being tracked on
-        /// </param>
-        /// <param name="workerId">
-        /// The worker application ID
-        /// </param>
-        /// <param name="executor">
-        /// Used to execute the user's function when changes are detected on "table"
-        /// </param>
-        /// <param name="logger">
-        /// Ilogger used to log information and warnings
-        /// </param>
-        /// <exception cref="ArgumentNullException">
-        /// Thrown if the executor or logger is null
-        /// </exception>
-        /// <exception cref="ArgumentException">
-        /// Thrown if table or connectionString are null or empty
-        /// </exception>
-        public SqlTableChangeMonitor(string table, string connectionString, string workerId, ITriggeredFunctionExecutor executor, ILogger logger)
+        /// <param name="connectionString">The SQL connection string used to connect to the user's database</param>
+        /// <param name="userTableId">The OBJECT_ID of the user table whose changes are being tracked on</param>
+        /// <param name="userTableName">The name of the user table</param>
+        /// <param name="userFunctionId">The unique ID that identifies user function</param>
+        /// <param name="workerTableName">The name of the worker table</param>
+        /// <param name="userTableColumns">List of all column names in the user table</param>
+        /// <param name="primaryKeyColumns">List of primary key column names in the user table</param>
+        /// <param name="executor">Used to execute the user's function when changes are detected on "table"</param>
+        /// <param name="logger">Ilogger used to log information and warnings</param>
+        public SqlTableChangeMonitor(
+            string connectionString,
+            int userTableId,
+            string userTableName,
+            string userFunctionId,
+            string workerTableName,
+            IReadOnlyList<string> userTableColumns,
+            IReadOnlyList<string> primaryKeyColumns,
+            ITriggeredFunctionExecutor executor,
+            ILogger logger)
         {
-            _ = !string.IsNullOrEmpty(table) ? table : throw new ArgumentNullException(nameof(table));
-            var tableObject = new SqlObject(table);
+            _ = !string.IsNullOrEmpty(connectionString) ? true : throw new ArgumentNullException(nameof(connectionString));
+            _ = !string.IsNullOrEmpty(userTableName) ? true : throw new ArgumentNullException(nameof(userTableName));
+            _ = !string.IsNullOrEmpty(userFunctionId) ? true : throw new ArgumentNullException(nameof(userFunctionId));
+            _ = !string.IsNullOrEmpty(workerTableName) ? true : throw new ArgumentNullException(nameof(workerTableName));
+            _ = userTableColumns ?? throw new ArgumentNullException(nameof(userTableColumns));
+            _ = primaryKeyColumns ?? throw new ArgumentNullException(nameof(primaryKeyColumns));
+            _ = executor ?? throw new ArgumentNullException(nameof(executor));
+            _ = logger ?? throw new ArgumentNullException(nameof(logger));
 
-            this._connectionString = !string.IsNullOrEmpty(connectionString) ? connectionString : throw new ArgumentNullException(nameof(connectionString));
-            this._workerId = !string.IsNullOrEmpty(workerId) ? workerId : throw new ArgumentNullException(nameof(workerId));
-            this._executor = executor ?? throw new ArgumentNullException(nameof(executor));
-            this._logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            this._connectionString = connectionString;
+            this._userTableId = userTableId;
+            this._userTableName = userTableName;
+            this._userFunctionId = userFunctionId;
+            this._workerTableName = workerTableName;
+            this._userTableColumns = primaryKeyColumns.Concat(userTableColumns.Except(primaryKeyColumns)).ToList();
+            this._primaryKeyColumns = primaryKeyColumns;
 
-            this._userTable = tableObject.FullName;
-            this._globalStateTable = $"[{Schema}].[Global_State_Table]";
+            // Prep search-conditions that will be used besides WHERE clause to match table rows.
+            this._rowMatchConditions = Enumerable.Range(0, BatchSize)
+                .Select(index => string.Join(" AND ", primaryKeyColumns.Select(col => $"{col} = @{col}_{index}")))
+                .ToList();
 
-            this._cancellationTokenSourceExecutor = new CancellationTokenSource();
+            this._executor = executor;
+            this._logger = logger;
+
             this._cancellationTokenSourceCheckForChanges = new CancellationTokenSource();
             this._cancellationTokenSourceRenewLeases = new CancellationTokenSource();
+            this._cancellationTokenSourceExecutor = new CancellationTokenSource();
+
             this._rowsLock = new SemaphoreSlim(1);
+            this._rows = new List<IReadOnlyDictionary<string, string>>();
+            this._leaseRenewalCount = 0;
+            this._state = State.CheckingForChanges;
 
-            this._rows = new List<Dictionary<string, string>>();
-            this._userTableColumns = new List<string>();
-            this._whereChecks = new List<string>();
-            this._primaryKeys = new Dictionary<string, string>();
-        }
-
-        /// <summary>
-        /// Starts the change monitor which begins polling for changes on the user's table specified in the constructor
-        /// </summary>
-        /// <returns></returns>
-        public async Task StartAsync()
-        {
-            int userTableId = await GetUserTableIDAsync(this._connectionString, this._userTable);
-            string workerTableName = $"[{Schema}].[Worker_Table_{userTableId}_{this._workerId}]";
-            await this.CreateWorkerTablesAsync(userTableId, workerTableName);
-
-#pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
+#pragma warning disable CS4014 // Queue the below tasks and exit. Do not wait for their completion.
             _ = Task.Run(() =>
             {
-                this.CheckForChangesAsync(userTableId, workerTableName, this._cancellationTokenSourceCheckForChanges.Token);
-                this.RenewLeasesAsync(workerTableName, this._cancellationTokenSourceRenewLeases.Token);
+                this.RunChangeConsumptionLoopAsync();
+                this.RunLeaseRenewalLoopAsync();
             });
 #pragma warning restore CS4014
         }
 
         /// <summary>
-        /// Stops the change monitor which stops polling for changes on the user's table.
-        /// If the change monitor is currently executing a set of changes, it is only stopped
-        /// once execution is finished and the user's function is triggered (whether or not
-        /// the trigger is successful) 
+        /// Stops the change monitor which stops polling for changes on the user's table. If the change monitor is
+        /// currently executing a set of changes, it is only stopped once execution is finished and the user's function
+        /// is triggered (whether or not the trigger is successful).
         /// </summary>
-        /// <returns></returns>
         public void Stop()
         {
             this._cancellationTokenSourceCheckForChanges.Cancel();
         }
 
+        public void Dispose()
+        {
+            throw new NotImplementedException();
+        }
+
         /// <summary>
-        /// Executed once every <see cref="LeaseTime"/> period. 
-        /// If the state of the change monitor is <see cref="State.ProcessingChanges"/>, then 
-        /// we will renew the leases held by the change monitor on "_rows"
+        /// Executed once every <see cref="PollingIntervalInSeconds"/> period. If the state of the change monitor is
+        /// <see cref="State.CheckingForChanges"/>, then the method query the change/worker tables for changes on the
+        /// user's table. If any are found, the state of the change monitor is transitioned to
+        /// <see cref="State.ProcessingChanges"/> and the user's function is executed with the found changes. If the
+        /// execution is successful, the leases on "_rows" are released and the state transitions to
+        /// <see cref="State.CheckingForChanges"/> once again.
         /// </summary>
-        /// <param name="workerTableName">The name of worker table
-        /// </param>
-        /// <param name="token">
-        /// If the token is cancelled, leases are no longer renewed
-        /// </param>
-        private async void RenewLeasesAsync(string workerTableName, CancellationToken token)
+        private async Task RunChangeConsumptionLoopAsync()
         {
             try
             {
+                CancellationToken token = this._cancellationTokenSourceCheckForChanges.Token;
+
+                using var connection = new SqlConnection(this._connectionString);
+                await connection.OpenAsync(token);
+
+                while (!token.IsCancellationRequested)
+                {
+                    if (this._state == State.CheckingForChanges)
+                    {
+                        // What should we do if this call gets stuck?
+                        await this.GetChangesAsync(token);
+                        await this.ProcessChangesAsync(token);
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(PollingIntervalInSeconds), token);
+                }
+            }
+            catch (Exception e)
+            {
+                // Only want to log the exception if it wasn't caused by StopAsync being called, since Task.Delay
+                // throws an exception if it's cancelled.
+                if (e.GetType() != typeof(TaskCanceledException))
+                {
+                    this._logger.LogError(e.Message);
+                }
+            }
+            finally
+            {
+                // If this thread exits due to any reason, then the lease renewal thread should exit as well. Otherwise,
+                // it will keep looping perpetually.
+                this._cancellationTokenSourceRenewLeases.Cancel();
+                this._cancellationTokenSourceCheckForChanges.Dispose();
+                this._cancellationTokenSourceExecutor.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Queries the change/worker tables to check for new changes on the user's table. If any are found, stores the
+        /// change along with the corresponding data from the user table in "_rows".
+        /// </summary>
+        private async Task GetChangesAsync(CancellationToken token)
+        {
+            try
+            {
+                using var connection = new SqlConnection(this._connectionString);
+                await connection.OpenAsync(token);
+
+                using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
+
+                // Update the version number stored in the global state table if necessary before using it.
+                using (SqlCommand updateTablesPreInvocationCommand = this.BuildUpdateTablesPreInvocation(connection, transaction))
+                {
+                    await updateTablesPreInvocationCommand.ExecuteNonQueryAsync(token);
+                }
+
+                // Use the version number to query for new changes.
+                using (SqlCommand getChangesCommand = this.BuildGetChangesCommand(connection, transaction))
+                {
+                    var rows = new List<IReadOnlyDictionary<string, string>>();
+
+                    using SqlDataReader reader = await getChangesCommand.ExecuteReaderAsync(token);
+                    while (await reader.ReadAsync(token))
+                    {
+                        rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader));
+                    }
+
+                    this._rows = rows;
+                }
+
+                // If changes were found, acquire leases on them.
+                if (this._rows.Count > 0)
+                {
+                    using SqlCommand acquireLeasesCommand = this.BuildAcquireLeasesCommand(connection, transaction);
+                    await acquireLeasesCommand.ExecuteNonQueryAsync(token);
+                }
+                await transaction.CommitAsync(token);
+            }
+            catch (Exception e)
+            {
+                // If there's an exception in any part of the process, we want to clear all of our data in memory and
+                // retry checking for changes again.
+                this._rows = new List<IReadOnlyDictionary<string, string>>();
+                this._logger.LogWarning($"Failed to check {this._userTableName} for new changes due to error: {e.Message}");
+            }
+        }
+
+        private async Task ProcessChangesAsync(CancellationToken token)
+        {
+            if (this._rows.Count > 0)
+            {
+                this._state = State.ProcessingChanges;
+                IReadOnlyList<SqlChangeTrackingEntry<T>> entries = null;
+
+                try
+                {
+                    // What should we do if this fails? It doesn't make sense to retry since it's not a connection based
+                    // thing. We could still try to trigger on the correctly processed entries, but that adds additional
+                    // complication because we don't want to release the leases on the incorrectly processed entries.
+                    // For now, just give up I guess?
+                    entries = this.GetSqlChangeTrackingEntries();
+                }
+                catch (Exception e)
+                {
+                    await this.ClearRowsAsync(
+                        $"Failed to extract user table data from table {this._userTableName} associated " +
+                        $"with change metadata due to error: {e.Message}", true);
+                }
+
+                if (entries != null)
+                {
+                    FunctionResult result = await this._executor.TryExecuteAsync(
+                        new TriggeredFunctionData() { TriggerValue = entries },
+                        this._cancellationTokenSourceExecutor.Token);
+
+                    if (result.Succeeded)
+                    {
+                        await this.ReleaseLeasesAsync(token);
+                    }
+                    else
+                    {
+                        // In the future might make sense to retry executing the function, but for now we just let
+                        // another worker try.
+                        await this.ClearRowsAsync(
+                            $"Failed to trigger user's function for table {this._userTableName} due to " +
+                            $"error: {result.Exception.Message}", true);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Executed once every <see cref="LeaseTime"/> period. If the state of the change monitor is
+        /// <see cref="State.ProcessingChanges"/>, then we will renew the leases held by the change monitor on "_rows".
+        /// </summary>
+        private async void RunLeaseRenewalLoopAsync()
+        {
+            try
+            {
+                CancellationToken token = this._cancellationTokenSourceRenewLeases.Token;
+
+                using var connection = new SqlConnection(this._connectionString);
+                await connection.OpenAsync(token);
+
                 while (!token.IsCancellationRequested)
                 {
                     await this._rowsLock.WaitAsync(token);
-                    try
-                    {
-                        if (this._state == State.ProcessingChanges)
-                        {
-                            await this.RenewLeasesAsync(workerTableName);
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        // This catch block is necessary so that the finally block is executed even in the case of an exception
-                        // (see https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/try-finally, third paragraph)
-                        // If we fail to renew the leases, multiple workers could be processing the same change data, but we have functionality
-                        // in place to deal with this (see design doc)
-                        this._logger.LogError($"Failed to renew leases due to error: {e.Message}");
-                    }
-                    finally
-                    {
-                        if (this._state == State.ProcessingChanges)
-                        {
-                            // Do we want to update this count even in the case of a failure to renew the leases? Probably, because
-                            // the count is simply meant to indicate how much time the other thread has spent processing changes essentially
-                            this._leaseRenewalCount++;
-                            // If this thread has been cancelled, then the _cancellationTokenSourceExecutor could have already been disposed so
-                            // shouldn't cancel it
-                            if (this._leaseRenewalCount == MaxLeaseRenewalCount && !token.IsCancellationRequested)
-                            {
-                                // If we keep renewing the leases, the thread responsible for processing the changes is stuck
-                                // If it's stuck, it has to be stuck in the function execution call (I think), so we should cancel the call
-                                this._logger.LogWarning($"Call to execute the function (TryExecuteAsync) seems to be stuck, so it is being cancelled");
-                                this._cancellationTokenSourceExecutor.Cancel();
-                                this._cancellationTokenSourceExecutor.Dispose();
-                                this._cancellationTokenSourceExecutor = new CancellationTokenSource();
-                            }
-                        }
-                        // Want to always release the lock at the end, even if renewing the leases failed
-                        this._rowsLock.Release();
-                    }
-                    // Want to make sure to renew the leases before they expire, so we renew them twice per lease period
+
+                    await this.RenewLeasesAsync(connection, token);
+
+                    // Want to make sure to renew the leases before they expire, so we renew them twice per lease period.
                     await Task.Delay(TimeSpan.FromSeconds(LeaseIntervalInSeconds / 2), token);
                 }
             }
             catch (Exception e)
             {
-                // Only want to log the exception if it wasn't caused by StopAsync being called, since Task.Delay throws an exception
-                // if it's cancelled
+                // Only want to log the exception if it wasn't caused by StopAsync being called, since Task.Delay throws
+                // an exception if it's cancelled.
                 if (e.GetType() != typeof(TaskCanceledException))
                 {
                     this._logger.LogError(e.Message);
@@ -209,250 +316,62 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             }
         }
 
-        /// <summary>
-        /// Executed once every <see cref="PollingIntervalInSeconds"/> period. If the state of the change monitor is <see cref="State.CheckingForChanges"/>, then 
-        /// the method query the change/worker tables for changes on the user's table. If any are found, the state of the change monitor is
-        /// transitioned to <see cref="State.ProcessingChanges"/> and the user's function is executed with the found changes. 
-        /// If execution is successful, the leases on "_rows" are released and the state transitions to <see cref="State.CheckingForChanges"/>
-        /// once more
-        /// </summary>
-        /// <param name="token">
-        /// If the token is cancelled, the thread stops polling for changes
-        /// </param>
-        /// <param name="userTableId">Used to identify the user table
-        /// </param>
-        /// <param name="workerTableName">The name of worker table
-        /// </param>
-        private async Task CheckForChangesAsync(int userTableId, string workerTableName, CancellationToken token)
+        private async Task RenewLeasesAsync(SqlConnection connection, CancellationToken token)
         {
             try
             {
-                while (!token.IsCancellationRequested)
+                if (this._state == State.ProcessingChanges)
                 {
-                    if (this._state == State.CheckingForChanges)
-                    {
-                        // What should we do if this call gets stuck?
-                        await this.CheckForChangesAsync(userTableId, workerTableName);
-
-                        if (this._rows.Count > 0)
-                        {
-                            this._state = State.ProcessingChanges;
-                            IEnumerable<SqlChangeTrackingEntry<T>> entries = null;
-
-                            try
-                            {
-                                // What should we do if this fails? It doesn't make sense to retry since it's not a connection based thing
-                                // We could still try to trigger on the correctly processed entries, but that adds additional complication because
-                                // we don't want to release the leases on the incorrectly processed entries
-                                // For now, just give up I guess?
-                                entries = this.GetSqlChangeTrackingEntries();
-                            }
-                            catch (Exception e)
-                            {
-                                await this.ClearRowsAsync($"Failed to extract user table data from table {this._userTable} associated with change metadata due to error: {e.Message}", true);
-                            }
-
-                            if (entries != null)
-                            {
-                                FunctionResult result = await this._executor.TryExecuteAsync(new TriggeredFunctionData() { TriggerValue = entries },
-                                    this._cancellationTokenSourceExecutor.Token);
-                                if (result.Succeeded)
-                                {
-                                    await this.ReleaseLeasesAsync(userTableId, workerTableName);
-                                }
-                                else
-                                {
-                                    // In the future might make sense to retry executing the function, but for now we just let another worker try
-                                    await this.ClearRowsAsync($"Failed to trigger user's function for table {this._userTable} due to error: {result.Exception.Message}", true);
-                                }
-                            }
-                        }
-                    }
-                    // The Delay will exit if the token is cancelled
-                    await Task.Delay(TimeSpan.FromSeconds(PollingIntervalInSeconds), token);
+                    // I don't think I need a transaction for renewing leases. If this worker reads in a row from the
+                    // worker table and determines that it corresponds to its batch of changes, but then that row gets
+                    // deleted by a cleanup task, it shouldn't renew the lease on it anyways.
+                    using SqlCommand renewLeasesCommand = this.BuildRenewLeasesCommand(connection);
+                    await renewLeasesCommand.ExecuteNonQueryAsync(token);
                 }
             }
             catch (Exception e)
             {
-                // Only want to log the exception if it wasn't caused by StopAsync being called, since Task.Delay throws an exception
-                // if it's cancelled
-                if (e.GetType() != typeof(TaskCanceledException))
-                {
-                    this._logger.LogError(e.Message);
-                }
+                // This catch block is necessary so that the finally block is executed even in the case of an exception
+                // (see https://docs.microsoft.com/dotnet/csharp/language-reference/keywords/try-finally, third
+                // paragraph). If we fail to renew the leases, multiple workers could be processing the same change
+                // data, but we have functionality in place to deal with this (see design doc).
+                this._logger.LogError($"Failed to renew leases due to error: {e.Message}");
             }
             finally
             {
-                // If this thread exits due to any reason, then the lease renewal thread should exit as well. Otherwise, it will keep looping
-                // perpetually. 
-                this._cancellationTokenSourceRenewLeases.Cancel();
-                this._cancellationTokenSourceCheckForChanges.Dispose();
-                this._cancellationTokenSourceExecutor.Dispose();
-            }
-        }
-
-        /// <summary>
-        /// Creates the worker table associated with the user's table, if one does not already exist.
-        /// Also creates the global state and worker batch sizes tables for this DB if they do not already exist.
-        /// Inserts a row into the global state table for this user table if one does not already exist, and inserts
-        /// a row for this worker ID and user table into the worker batch sizes table if one does not already exist
-        /// </summary>
-        /// <param name="userTableId">Used to identify the user table</param>
-        /// <param name="workerTableName">The name of worker table </param>
-        private async Task CreateWorkerTablesAsync(int userTableId, string workerTableName)
-        {
-            await this.GetUserTableSchemaAsync();
-
-            using var connection = new SqlConnection(this._connectionString);
-            await connection.OpenAsync();
-            using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
-            // Create the schema where the worker tables will be located if it does not already exist
-            using (SqlCommand createSchemaCommand = BuildCreateSchemaCommand(connection, transaction))
-            {
-                await createSchemaCommand.ExecuteNonQueryAsync();
-            }
-
-            // Create the global state table, if one doesn't already exist for this database
-            using (SqlCommand createGlobalStateTableCommand = this.BuildCreateGlobalStateTableCommand(connection, transaction))
-            {
-                await createGlobalStateTableCommand.ExecuteNonQueryAsync();
-            }
-
-            // Insert a row into the global state table for this user table, if one doesn't already exist
-            using (SqlCommand insertRowGlobalStateTableCommand = this.BuildInsertRowGlobalStateTableCommand(connection, transaction, userTableId))
-            {
-                try
+                if (this._state == State.ProcessingChanges)
                 {
-                    await insertRowGlobalStateTableCommand.ExecuteNonQueryAsync();
-                }
-                // Could fail if we try to insert a NULL value into the GlobalVersionNumber, which happens when CHANGE_TRACKING_MIN_VALID_VERSION 
-                // returns NULL for the user table, meaning that change tracking is not enabled for either the database or table (or both)
-                catch (Exception e)
-                {
-                    string errorMessage = $"Failed to start processing changes to table {this._userTable}, potentially because change tracking was not " +
-                        $"enabled for the table or database {connection.Database}.";
-                    this._logger.LogWarning(errorMessage + $" Exact exception thrown is {e.Message}");
-                    throw new InvalidOperationException(errorMessage);
-                }
-            }
+                    // Do we want to update this count even in the case of a failure to renew the leases? Probably,
+                    // because the count is simply meant to indicate how much time the other thread has spent processing
+                    // changes essentially.
+                    this._leaseRenewalCount += 1;
 
-            // Create the worker table, if one doesn't already exist for this user table
-            using (SqlCommand createWorkerTableCommand = this.BuildCreateWorkerTableCommand(connection, transaction, workerTableName))
-            {
-                await createWorkerTableCommand.ExecuteNonQueryAsync();
-            }
-
-            await transaction.CommitAsync();
-        }
-
-        /// <summary>
-        /// Retrieves the primary keys of the user's table and stores them in the _primaryKeys dictionary,
-        /// which maps from primary key name to primary key type
-        /// Also retrieves the column names of the user's table and stores them in _userTableColumns,
-        /// as well as the user table's OBJECT_ID which it stores to _userTableId
-        /// </summary>
-        /// <exception cref="InvalidOperationException">
-        /// Thrown if the query to retrieve the OBJECT_ID of the user table fails to correctly execute
-        /// This can happen if the OBJECT_ID call returns NULL, meaning that the user table might not exist in the database
-        /// </exception>
-        private async Task GetUserTableSchemaAsync()
-        {
-            using var connection = new SqlConnection(this._connectionString);
-            // I don't think I need a transaction for this since the command just reads data
-            await connection.OpenAsync();
-            // Determine the primary keys of the user table
-            using (SqlCommand getPrimaryKeysCommand = this.BuildGetUserTablePrimaryKeysCommand(connection))
-            {
-                using SqlDataReader reader = await getPrimaryKeysCommand.ExecuteReaderAsync();
-                await this.DeterminePrimaryKeyTypesAsync(reader);
-            }
-
-            this._userTableColumns.Clear();
-            // Determine the names of the user table columns
-            using (SqlCommand getColumnNamesCommand = this.BuildGetUserTableColumnNamesCommand(connection))
-            {
-                using SqlDataReader reader = await getColumnNamesCommand.ExecuteReaderAsync();
-                while (await reader.ReadAsync())
-                {
-                    this._userTableColumns.Add(reader.GetString(0));
-                }
-            }
-        }
-
-        /// <summary>
-        /// Queries the change/worker tables to check for new changes on the user's table. If any are found,
-        /// stores the change along with the corresponding data from the user table in "_rows"
-        /// </summary>
-        /// <param name="userTableId">Used to identify the user table</param>
-        /// <param name="workerTableName">The name of worker table </param>
-        /// <returns></returns> 
-        private async Task CheckForChangesAsync(int userTableId, string workerTableName)
-        {
-            try
-            {
-                using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync();
-                using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
-                // Update the version number stored in the global state table if necessary before using it 
-                using (SqlCommand updateGlobalVersionNumberCommand = this.BuildUpdateGlobalVersionNumberCommand(connection, transaction, userTableId))
-                {
-                    await updateGlobalVersionNumberCommand.ExecuteNonQueryAsync();
-                }
-
-                // Use the version number to query for new changes
-                using (SqlCommand getChangesCommand = this.BuildCheckForChangesCommand(connection, transaction, userTableId, workerTableName))
-                {
-                    using SqlDataReader reader = await getChangesCommand.ExecuteReaderAsync();
-                    var cols = new List<string>();
-                    while (await reader.ReadAsync())
+                    // If this thread has been cancelled, then the _cancellationTokenSourceExecutor could have already
+                    // been disposed so shouldn't cancel it.
+                    if (this._leaseRenewalCount == MaxLeaseRenewalCount && !token.IsCancellationRequested)
                     {
-                        this._rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader, cols));
+                        this._logger.LogWarning("Call to execute the function (TryExecuteAsync) seems to be stuck, so it is being cancelled");
+
+                        // If we keep renewing the leases, the thread responsible for processing the changes is stuck.
+                        // If it's stuck, it has to be stuck in the function execution call (I think), so we should
+                        // cancel the call.
+                        this._cancellationTokenSourceExecutor.Cancel();
+                        this._cancellationTokenSourceExecutor = new CancellationTokenSource();
                     }
                 }
 
-                // If changes were found, acquire leases on them
-                if (this._rows.Count != 0)
-                {
-                    using SqlCommand acquireLeaseCommand = this.BuildAcquireLeasesCommand(connection, transaction, workerTableName);
-                    await acquireLeaseCommand.ExecuteNonQueryAsync();
-                }
-                await transaction.CommitAsync();
+                // Want to always release the lock at the end, even if renewing the leases failed.
+                this._rowsLock.Release();
             }
-            catch (Exception e)
-            {
-                // If there's an exception in any part of the process, we want to clear all of our data in memory and retry
-                // checking for changes again
-                this._rows.Clear();
-                this._whereChecks.Clear();
-                this._logger.LogWarning($"Failed to check {this._userTable} for new changes due to error: {e.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Renews the leases held on _rows
-        /// </summary>
-        /// <param name="workerTableName">The name of worker table </param>
-        private async Task RenewLeasesAsync(string workerTableName)
-        {
-            using var connection = new SqlConnection(this._connectionString);
-            await connection.OpenAsync();
-            // I don't think I need a transaction for renewing leases. If this worker reads in a row from the worker table
-            // and determines that it corresponds to its batch of changes, but then that row gets deleted by a cleanup task,
-            // it shouldn't renew its lease on it anyways
-            using SqlCommand renewLeaseCommand = this.BuildRenewLeasesCommand(connection, workerTableName);
-            await renewLeaseCommand.ExecuteNonQueryAsync();
         }
 
         /// <summary>
         /// Resets the in-memory state of the change monitor and sets it to start polling for changes again.
         /// </summary>
         /// <param name="error">
-        /// The error messages the logger will report describing the reason function execution failed (used only in the case of a failure)
+        /// The error messages the logger will report describing the reason function execution failed (used only in the case of a failure).
         /// </param>
-        /// <param name="acquireLock">
-        /// True if ClearRowsAsync should acquire the _rowsLock (only true in the case of a failure)
-        /// </param>
-        /// <returns></returns>
+        /// <param name="acquireLock">True if ClearRowsAsync should acquire the "_rowsLock" (only true in the case of a failure)</param>
         private async Task ClearRowsAsync(string error, bool acquireLock)
         {
             if (acquireLock)
@@ -460,601 +379,347 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 this._logger.LogError(error);
                 await this._rowsLock.WaitAsync();
             }
+
             this._leaseRenewalCount = 0;
-            this._rows.Clear();
-            this._whereChecks.Clear();
             this._state = State.CheckingForChanges;
+            this._rows = new List<IReadOnlyDictionary<string, string>>();
             this._rowsLock.Release();
         }
 
         /// <summary>
-        /// Releases the leases held on _rows
+        /// Releases the leases held on "_rows".
         /// </summary>
-        /// </param>
-        /// <param name="userTableId">Used to identify the user table
-        /// </param>
-        /// <param name="workerTableName">The name of worker table 
-        /// </param>
         /// <returns></returns>
-        private async Task ReleaseLeasesAsync(int userTableId, string workerTableName)
+        private async Task ReleaseLeasesAsync(CancellationToken token)
         {
-            // Don't want to change the _rows while another thread is attempting to renew leases on them
-            await this._rowsLock.WaitAsync();
-            long newVersionNumber = this.CalculateNewVersionNumber();
+            // Don't want to change the "_rows" while another thread is attempting to renew leases on them.
+            await this._rowsLock.WaitAsync(token);
+            long newLastSyncVersion = this.RecomputeLastSyncVersion();
+
             try
             {
                 using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync();
+                await connection.OpenAsync(token);
                 using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
-                // Release the leases held on _rows
-                using (SqlCommand releaseLeaseCommand = this.BuildReleaseLeasesCommand(connection, transaction, workerTableName))
+
+                // Release the leases held on "_rows".
+                using (SqlCommand releaseLeasesCommand = this.BuildReleaseLeasesCommand(connection, transaction))
                 {
-                    await releaseLeaseCommand.ExecuteNonQueryAsync();
+                    await releaseLeasesCommand.ExecuteNonQueryAsync(token);
                 }
 
-                // Update the global state table if we have processed all changes with version number <= newVersionNumber, and clean up the worker table
-                // to remove all rows with VersionNumber <= newVersionNumber
-                using (SqlCommand updateGlobalStateTableCommand = this.BuildUpdateGlobalStateTableCommand(connection, transaction, newVersionNumber, userTableId, workerTableName))
+                // Update the global state table if we have processed all changes with ChangeVersion <= newLastSyncVersion,
+                // and clean up the worker table to remove all rows with ChangeVersion <= newLastSyncVersion.
+                using (SqlCommand updateTablesPostInvocationCommand = this.BuildUpdateTablesPostInvocation(connection, transaction, newLastSyncVersion))
                 {
-                    await updateGlobalStateTableCommand.ExecuteNonQueryAsync();
+                    await updateTablesPostInvocationCommand.ExecuteNonQueryAsync(token);
                 }
-                await transaction.CommitAsync();
+
+                await transaction.CommitAsync(token);
 
             }
             catch (Exception e)
             {
                 // What should we do if releasing the leases fails? We could try to release them again or just wait,
-                // since eventually the lease time will expire. Then another thread will re-process the same changes though,
-                // so less than ideal. But for now that's the functionality
-                this._logger.LogError($"Failed to release leases for user table {this._userTable} due to error: {e.Message}");
+                // since eventually the lease time will expire. Then another thread will re-process the same changes
+                // though, so less than ideal. But for now that's the functionality.
+                this._logger.LogError($"Failed to release leases for user table {this._userTableName} due to error: {e.Message}");
             }
             finally
             {
                 // Want to do this before releasing the lock in case the renew leases thread wakes up. It will see that
-                // the state is checking for changes and not renew the (just released) leases
+                // the state is checking for changes and not renew the (just released) leases.
                 await this.ClearRowsAsync(string.Empty, false);
             }
         }
 
         /// <summary>
-        /// Builds the command to determine the primary key column names and types of the user table
+        /// Calculates the new version number to attempt to update LastSyncVersion in global state table to. If all
+        /// version numbers in _rows are the same, use that version number. If they aren't, use the second largest
+        /// version number. For an explanation as to why this method was chosen, see 9c in Steps of Operation in this
+        /// design doc: https://microsoft-my.sharepoint.com/:w:/p/t-sotevo/EQdANWq9ZWpKm8e48TdzUwcBGZW07vJmLf8TL_rtEG8ixQ?e=owN2EX.
         /// </summary>
-        /// <param name="connection">The connection to add to the returned SqlCommand</param>
-        /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildGetUserTablePrimaryKeysCommand(SqlConnection connection)
+        private long RecomputeLastSyncVersion()
         {
-            string getUserTablePrimaryKeysQuery =
-                $"SELECT c.name, t.name, c.max_length, c.precision, c.scale\n" +
-                $"FROM sys.indexes i\n" +
-                $"INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id\n" +
-                $"INNER JOIN sys.columns c ON ic.object_id = c.object_id AND c.column_id = ic.column_id\n" +
-                $"INNER JOIN sys.types t ON c.user_type_id = t.user_type_id\n" +
-                $"WHERE i.is_primary_key = 1 and i.object_id = OBJECT_ID(N\'{this._userTable}\', \'U\');";
+            var changeVersionSet = new SortedSet<long>();
+            foreach (Dictionary<string, string> row in this._rows)
+            {
+                string changeVersion = row["SYS_CHANGE_VERSION"];
+                changeVersionSet.Add(long.Parse(changeVersion, CultureInfo.InvariantCulture));
+            }
 
-            return new SqlCommand(getUserTablePrimaryKeysQuery, connection);
+            // If there are at least two version numbers in this set, return the second highest one. Otherwise, return
+            // the only version number in the set.
+            return changeVersionSet.ElementAt(changeVersionSet.Count > 1 ? changeVersionSet.Count - 2 : 0);
         }
 
         /// <summary>
-        /// Builds the command to determine the names of the user table columns
+        /// Builds up the list of SqlChangeTrackingEntries passed to the user's triggered function based on the data
+        /// stored in "_rows". If any of the entries correspond to a deleted row, then the <see cref="SqlChangeTrackingEntry.Data">
+        ///  will be populated with only the primary key values of the deleted row.
         /// </summary>
-        /// <param name="connection">The connection to add to the returned SqlCommand</param>
-        /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildGetUserTableColumnNamesCommand(SqlConnection connection)
+        /// <returns>The list of entries</returns>
+        private IReadOnlyList<SqlChangeTrackingEntry<T>> GetSqlChangeTrackingEntries()
         {
-            string getUserTableColumnNamesQuery =
-                $"SELECT name\n" +
-                $"FROM sys.columns\n" +
-                $"WHERE object_id = OBJECT_ID(\'{this._userTable}\');";
+            var entries = new List<SqlChangeTrackingEntry<T>>();
+            foreach (Dictionary<string, string> row in this._rows)
+            {
+                SqlChangeType changeType = GetChangeType(row);
 
-            return new SqlCommand(getUserTableColumnNamesQuery, connection);
+                // If the row has been deleted, there is no longer any data for it in the user table. The best we can do
+                // is populate the entry with the primary key values of the row.
+                Dictionary<string, string> entry = changeType == SqlChangeType.Delete
+                    ? this._primaryKeyColumns.ToDictionary(col => col, col => row[col])
+                    : this._userTableColumns.ToDictionary(col => col, col => row[col]);
+
+                entries.Add(new SqlChangeTrackingEntry<T>(changeType, JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(entry))));
+            }
+
+            return entries;
         }
 
         /// <summary>
-        /// Builds the command to update the global state table in the case of a new minimum valid version number
-        /// Sets the GlobalVersionNumber for this _userTable to be the new minimum valid version number
+        /// Gets the change associated with this row (either an insert, update or delete).
+        /// </summary>
+        /// <param name="row">The (combined) row from the change table and worker table</param>
+        /// <exception cref="InvalidDataException">Thrown if the value of the "SYS_CHANGE_OPERATION" column is none of "I", "U", or "D"</exception>
+        /// <returns>SqlChangeType.Insert for an insert, SqlChangeType.Update for an update, and SqlChangeType.Delete for a delete</returns>
+        private static SqlChangeType GetChangeType(Dictionary<string, string> row)
+        {
+            string changeType = row["SYS_CHANGE_OPERATION"];
+
+            return changeType switch
+            {
+                "I" => SqlChangeType.Insert,
+                "U" => SqlChangeType.Update,
+                "D" => SqlChangeType.Delete,
+                _ => throw new InvalidDataException($"Invalid change type encountered in change table row: {row}"),
+            };
+        }
+
+        /// <summary>
+        /// Builds the command to update the global state table in the case of a new minimum valid version number.
+        /// Sets the LastSyncVersion for this _userTableName to be the new minimum valid version number.
         /// </summary>
         /// <param name="connection">The connection to add to the returned SqlCommand</param>
         /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="userTableId">Used to identify the user table</param>
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildUpdateGlobalVersionNumberCommand(SqlConnection connection, SqlTransaction transaction, int userTableId)
+        private SqlCommand BuildUpdateTablesPreInvocation(SqlConnection connection, SqlTransaction transaction)
         {
-            string updateGlobalStateTableCommand = $@"
-                DECLARE @min_version bigint;
-                DECLARE @current_version bigint;
-                SET @min_version = CHANGE_TRACKING_MIN_VALID_VERSION({userTableId});
-                SELECT @current_version = GlobalVersionNumber FROM {this._globalStateTable} WHERE UserTableID = {userTableId} AND WorkerID = '{this._workerId}';
+            string updateTablesPreInvocationQuery = $@"
+                DECLARE @min_valid_version bigint;
+                SET @min_valid_version = CHANGE_TRACKING_MIN_VALID_VERSION({this._userTableId});
+
+                DECLARE @last_sync_version bigint;
+                SELECT @last_sync_version = LastSyncVersion
+                FROM {SqlTriggerConstants.GlobalStateTableName}
+                WHERE UserFunctionID = '{this._userFunctionId}' AND UserTableID = {this._userTableId};
                 
-                IF @current_version < @min_version
-                    UPDATE {this._globalStateTable} SET GlobalVersionNumber = @min_version WHERE UserTableID = {userTableId} AND WorkerID = '{this._workerId}';
+                IF @last_sync_version < @min_valid_version
+                    UPDATE {SqlTriggerConstants.GlobalStateTableName}
+                    SET LastSyncVersion = @min_valid_version
+                    WHERE UserFunctionID = '{this._userFunctionId}' AND UserTableID = {this._userTableId};
             ";
 
-            return new SqlCommand(updateGlobalStateTableCommand, connection, transaction);
+            return new SqlCommand(updateTablesPreInvocationQuery, connection, transaction);
         }
 
         /// <summary>
-        /// Builds the query to check for changes on the user's table (<see cref="CheckForChangesAsync()"/>)
+        /// Builds the query to check for changes on the user's table (<see cref="RunChangeConsumptionLoopAsync()"/>).
         /// </summary>
         /// <param name="connection">The connection to add to the returned SqlCommand</param>
         /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="userTableId">Used to identify the user table</param>
-        /// <param name="workerTableName">The name of worker table </param>
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildCheckForChangesCommand(SqlConnection connection, SqlTransaction transaction, int userTableId, string workerTableName)
+        private SqlCommand BuildGetChangesCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            string primaryKeysSelectList = string.Join(", ", this._primaryKeys.Keys.Select(key => $"c.{key}"));
-            string leftOuterJoinWorkerTable = string.Join(" AND ", this._primaryKeys.Keys.Select(key => $"c.{key} = w.{key}"));
-            string leftOuterJoinUserTable = string.Join(" AND ", this._primaryKeys.Keys.Select(key => $"c.{key} = u.{key}"));
-
-            var nonPrimaryKeyCols = this._userTableColumns.Where(col => !this._primaryKeys.ContainsKey(col)).ToList();
-            string userTableColumnsSelectList =
-                string.Join(", ", nonPrimaryKeyCols.Select(col => $"u.{col}")) + (nonPrimaryKeyCols.Any() ? ", " : string.Empty);
+            string selectList = string.Join(", ", this._userTableColumns.Select(col => $"u.{col}"));
+            string userTableJoinCondition = string.Join(" AND ", this._primaryKeyColumns.Select(col => $"c.{col} = u.{col}"));
+            string workerTableJoinCondition = string.Join(" AND ", this._primaryKeyColumns.Select(col => $"c.{col} = w.{col}"));
 
             string getChangesQuery = $@"
-                DECLARE @version bigint;
-                SELECT @version = GlobalVersionNumber FROM {this._globalStateTable} WHERE UserTableID = {userTableId} AND WorkerID = '{this._workerId}';
-                SELECT TOP {BatchSize} * FROM
-                    (SELECT {primaryKeysSelectList}, {userTableColumnsSelectList}
-                        c.SYS_CHANGE_VERSION, c.SYS_CHANGE_OPERATION,
-                        w.VersionNumber, w.DequeueCount, w.LeaseExpirationTime
-                    FROM CHANGETABLE (CHANGES {this._userTable}, @version) AS c
-                    LEFT OUTER JOIN {workerTableName} AS w with (TABLOCKX) ON {leftOuterJoinWorkerTable}
-                    LEFT OUTER JOIN {this._userTable} AS u ON {leftOuterJoinUserTable}) AS Changes
+                DECLARE @last_sync_version bigint;
+                SELECT @last_sync_version = LastSyncVersion
+                FROM {SqlTriggerConstants.GlobalStateTableName}
+                WHERE UserFunctionID = '{this._userFunctionId}' AND UserTableID = {this._userTableId};
+
+                SELECT TOP {BatchSize}
+                    {selectList},
+                    c.SYS_CHANGE_VERSION, c.SYS_CHANGE_OPERATION,
+                    w.ChangeVersion, w.AttemptCount, w.LeaseExpirationTime
+                FROM CHANGETABLE (CHANGES {this._userTableName}, @last_sync_version) AS c
+                LEFT OUTER JOIN {this._userTableName} AS u ON {userTableJoinCondition}
+                LEFT OUTER JOIN {this._workerTableName} AS w WITH (TABLOCKX) ON {workerTableJoinCondition}
                 WHERE
-                    (Changes.LeaseExpirationTime IS NULL
-                        AND (Changes.VersionNumber IS NULL OR Changes.VersionNumber < Changes.SYS_CHANGE_VERSION)
-                        OR Changes.LeaseExpirationTime < SYSDATETIME())
-                    AND (Changes.DequeueCount IS NULL OR Changes.DequeueCount < {MaxDequeueCount})
-                ORDER BY Changes.SYS_CHANGE_VERSION ASC;
+                    w.AttemptCount <= {MaxAttemptCount} AND
+                    ((w.LeaseExpirationTime IS NULL AND w.ChangeVersion < c.SYS_CHANGE_VERSION) OR w.LeaseExpirationTime < SYSDATETIME())
+                ORDER BY c.SYS_CHANGE_VERSION ASC;
             ";
 
             return new SqlCommand(getChangesQuery, connection, transaction);
         }
 
         /// <summary>
-        /// Builds the query to acquire leases on the rows in "_rows" if changes are detected in the user's table (<see cref="CheckForChangesAsync()"/>)
+        /// Builds the query to acquire leases on the rows in "_rows" if changes are detected in the user's table
+        /// (<see cref="RunChangeConsumptionLoopAsync()"/>).
         /// </summary>
         /// <param name="connection">The connection to add to the returned SqlCommand</param>
         /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="workerTableName">The name of worker table </param>
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildAcquireLeasesCommand(SqlConnection connection, SqlTransaction transaction, string workerTableName)
+        private SqlCommand BuildAcquireLeasesCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var acquireLeasesCommand = new SqlCommand();
-            SqlBindingUtilities.AddPrimaryKeyParametersToCommand(acquireLeasesCommand, this._rows, this._primaryKeys.Keys);
-            string acquireLeasesCommandString = string.Empty;
-            int index = 0;
+            var acquireLeasesQuery = new StringBuilder();
 
-            foreach (Dictionary<string, string> row in this._rows)
+            for (int index = 0; index < this._rows.Count; index++)
             {
-                string whereCheck = string.Join(" AND ", this._primaryKeys.Keys.Select(key => $"{key} = @{key}_{index}"));
-                string valuesList = string.Join(", ", this._primaryKeys.Keys.Select(key => $"@{key}_{index}"));
-                this._whereChecks.Add(whereCheck);
+                string valuesList = string.Join(", ", this._primaryKeyColumns.Select(col => $"@{col}_{index}"));
+                string changeVersion = this._rows[index]["SYS_CHANGE_VERSION"];
 
-                row.TryGetValue("SYS_CHANGE_VERSION", out string versionNumber);
-                acquireLeasesCommandString +=
-                    $"IF NOT EXISTS (SELECT * FROM {workerTableName} with (TABLOCKX) WHERE {whereCheck})\n" +
-                    $"INSERT INTO {workerTableName} with (TABLOCKX)\n" +
-                    $"VALUES ({valuesList}, DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()), 0, {versionNumber})\n" +
-                    $"ELSE\n" +
-                    $"UPDATE {workerTableName} with (TABLOCKX)\n" +
-                    $"SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()), DequeueCount = DequeueCount + 1, " +
-                    $"VersionNumber = {versionNumber}\n" +
-                    $"WHERE {whereCheck};\n";
-
-                index++;
+                acquireLeasesQuery.Append($@"
+                    IF NOT EXISTS (SELECT * FROM {this._workerTableName} WITH (TABLOCKX) WHERE {this._rowMatchConditions[index]})
+                        INSERT INTO {this._workerTableName} WITH (TABLOCKX)
+                        VALUES ({valuesList}, {changeVersion}, 1, DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME()));
+                    ELSE
+                        UPDATE {this._workerTableName} WITH (TABLOCKX)
+                        SET
+                            ChangeVersion = {changeVersion},
+                            AttemptCount = AttemptCount + 1,
+                            LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME())
+                        WHERE {this._rowMatchConditions[index]};
+                ");
             }
 
-            acquireLeasesCommand.CommandText = acquireLeasesCommandString;
-            acquireLeasesCommand.Connection = connection;
-            acquireLeasesCommand.Transaction = transaction;
-            return acquireLeasesCommand;
+            return this.GetSqlCommandWithParameters(acquireLeasesQuery.ToString(), connection, transaction);
         }
 
         /// <summary>
-        /// Builds the query to renew leases on the rows in "_rows" (<see cref="RenewLeasesAsync(CancellationToken)"/>)
+        /// Builds the query to renew leases on the rows in "_rows" (<see cref="RenewLeasesAsync(CancellationToken)"/>).
         /// </summary>
         /// <param name="connection">The connection to add to the returned SqlCommand</param>
-        /// <param name="workerTableName">The name of worker table </param>
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildRenewLeasesCommand(SqlConnection connection, string workerTableName)
+        private SqlCommand BuildRenewLeasesCommand(SqlConnection connection)
         {
-            var renewLeasesCommand = new SqlCommand();
-            SqlBindingUtilities.AddPrimaryKeyParametersToCommand(renewLeasesCommand, this._rows, this._primaryKeys.Keys);
-            string renewLeasesCommandString = string.Empty;
-            int index = 0;
+            var renewLeasesQuery = new StringBuilder();
 
-            foreach (Dictionary<string, string> row in this._rows)
+            for (int index = 0; index < this._rows.Count; index++)
             {
-                renewLeasesCommandString +=
-                $"UPDATE {workerTableName} with (TABLOCKX)\n" +
-                $"SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME())\n" +
-                $"WHERE {this._whereChecks.ElementAt(index++)};\n";
+                renewLeasesQuery.Append($@"
+                    UPDATE {this._workerTableName} WITH (TABLOCKX)
+                    SET LeaseExpirationTime = DATEADD(s, {LeaseIntervalInSeconds}, SYSDATETIME())
+                    WHERE {this._rowMatchConditions[index]};
+                ");
             }
 
-            renewLeasesCommand.CommandText = renewLeasesCommandString;
-            renewLeasesCommand.Connection = connection;
-
-            return renewLeasesCommand;
+            return this.GetSqlCommandWithParameters(renewLeasesQuery.ToString(), connection, null);
         }
 
         /// <summary>
-        /// Builds the query to release leases on the rows in "_rows" after successful invocation of the user's function (<see cref="CheckForChangesAsync()"/>)
+        /// Builds the query to release leases on the rows in "_rows" after successful invocation of the user's function
+        /// (<see cref="RunChangeConsumptionLoopAsync()"/>).
         /// </summary>
         /// <param name="connection">The connection to add to the returned SqlCommand</param>
         /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="workerTableName">Used to identify the user table</param>
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildReleaseLeasesCommand(SqlConnection connection, SqlTransaction transaction, string workerTableName)
+        private SqlCommand BuildReleaseLeasesCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            var releaseLeasesCommand = new SqlCommand();
-            string releaseLeasesCommandString = $"DECLARE @current_version bigint;\n";
-            SqlBindingUtilities.AddPrimaryKeyParametersToCommand(releaseLeasesCommand, this._rows, this._primaryKeys.Keys);
-            int index = 0;
+            var releaseLeasesQuery = new StringBuilder("DECLARE @current_version bigint;\n");
 
-            foreach (Dictionary<string, string> row in this._rows)
+            for (int index = 0; index < this._rows.Count; index++)
             {
-                string whereCheck = this._whereChecks.ElementAt(index++);
-                row.TryGetValue("SYS_CHANGE_VERSION", out string versionNumber);
+                string changeVersion = this._rows[index]["SYS_CHANGE_VERSION"];
 
-                releaseLeasesCommandString +=
-                    $"SELECT @current_version = VersionNumber\n" +
-                    $"FROM {workerTableName} with (TABLOCKX) \n" +
-                    $"WHERE {whereCheck};\n" +
-                    $"IF {versionNumber} >= @current_version\n" +
-                    $"UPDATE {workerTableName} with (TABLOCKX) \n" +
-                    $"SET LeaseExpirationTime = NULL, DequeueCount = 0, VersionNumber = {versionNumber}\n" +
-                    $"WHERE {whereCheck};\n";
+                releaseLeasesQuery.Append($@"
+                    SELECT @current_change_version = ChangeVersion
+                    FROM {this._workerTableName} WITH (TABLOCKX)
+                    WHERE {this._rowMatchConditions[index]};
+
+                    IF @current_change_version < {changeVersion}
+                        UPDATE {this._workerTableName} WITH (TABLOCKX) 
+                        SET ChangeVersion = {changeVersion}, Attempts = 0, LeaseExpirationTime = NULL
+                        WHERE {this._rowMatchConditions[index]};
+                ");
             }
 
-            releaseLeasesCommand.CommandText = releaseLeasesCommandString;
-            releaseLeasesCommand.Connection = connection;
-            releaseLeasesCommand.Transaction = transaction;
-
-            return releaseLeasesCommand;
+            return this.GetSqlCommandWithParameters(releaseLeasesQuery.ToString(), connection, transaction);
         }
 
         /// <summary>
-        /// Builds the command to create the worker table if one does not already exist (<see cref="CreateWorkerTablesAsync"/>)
-        /// </summary>
-        /// <param name="connection">The connection to attach to the returned SqlCommand</param>
-        /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="workerTableName">The name of worker table</param>
-        /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildCreateWorkerTableCommand(SqlConnection connection, SqlTransaction transaction, string workerTableName)
-        {
-
-            string primaryKeysWithTypes = string.Join(",\n", this._primaryKeys.Select(pair => $"{pair.Key} {pair.Value}"));
-            string primaryKeysList = string.Join(", ", this._primaryKeys.Keys);
-
-            string createWorkerTableCommand =
-                $"IF OBJECT_ID(N\'{workerTableName}\', \'U\') IS NULL\n" +
-                $"CREATE TABLE {workerTableName} (\n" +
-                $"{primaryKeysWithTypes},\n" +
-                $"LeaseExpirationTime datetime2,\n" +
-                $"DequeueCount int,\n" +
-                $"VersionNumber bigint\n" +
-                $"PRIMARY KEY({primaryKeysList})\n" +
-                $");\n";
-
-            return new SqlCommand(createWorkerTableCommand, connection, transaction);
-        }
-
-        /// <summary>
-        /// Builds the command to create the schema where the worker tables are located if it does not already exist (<see cref="CreateWorkerTablesAsync"/>)
-        /// </summary>
-        /// <param name="connection">The connection to attach to the returned SqlCommand</param>
-        /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private static SqlCommand BuildCreateSchemaCommand(SqlConnection connection, SqlTransaction transaction)
-        {
-            string createSchemaCommand =
-                $"IF SCHEMA_ID(N\'{Schema}\') IS NULL\n" +
-                $"EXEC (\'CREATE SCHEMA {Schema}\')";
-
-            return new SqlCommand(createSchemaCommand, connection, transaction);
-        }
-
-        /// <summary>
-        /// Builds the command to create the global state table if one does not already exist (<see cref="CreateWorkerTablesAsync"/>)
-        /// </summary>
-        /// <param name="connection">The connection to attach to the returned SqlCommand</param>
-        /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildCreateGlobalStateTableCommand(SqlConnection connection, SqlTransaction transaction)
-        {
-            string createGlobalStateTableCommand = $@"
-                IF OBJECT_ID(N'{this._globalStateTable}', N'U') IS NULL
-                    CREATE TABLE {this._globalStateTable} (
-                        UserTableID int,
-                        WorkerID char(80),
-                        GlobalVersionNumber bigint NOT NULL,
-                        PRIMARY KEY (UserTableID, WorkerID)
-                    );
-            ";
-
-            return new SqlCommand(createGlobalStateTableCommand, connection, transaction);
-        }
-
-        /// <summary>
-        /// Builds the command to insert a row into the global state table for this user table, if such a row doesn't already exist
-        /// </summary>
-        /// <param name="connection">The connection to attach to the returned SqlCommand</param>
-        /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="userTableId">Used to identify the user table</param>
-        /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildInsertRowGlobalStateTableCommand(SqlConnection connection, SqlTransaction transaction, int userTableId)
-        {
-            string insertRowGlobalStateTableCommand = $@"
-                IF NOT EXISTS (SELECT * FROM {this._globalStateTable} WHERE UserTableID = {userTableId} AND WorkerID = '{this._workerId}')
-                    INSERT INTO {this._globalStateTable}
-                    VALUES ({userTableId}, '{this._workerId}', CHANGE_TRACKING_MIN_VALID_VERSION({userTableId}));
-            ";
-
-            return new SqlCommand(insertRowGlobalStateTableCommand, connection, transaction);
-        }
-
-        /// <summary>
-        /// Builds the command to update the global version number in _globalStateTable after successful invocation of the user's function
-        /// If the global version number is updated, also cleans the worker table and removes all rows for which VersionNumber <= newVersionNumber
+        /// Builds the command to update the global version number in _globalStateTable after successful invocation of
+        /// the user's function. If the global version number is updated, also cleans the worker table and removes all
+        /// rows for which ChangeVersion <= newLastSyncVersion.
         /// </summary>
         /// <param name="connection">The connection to add to the returned SqlCommand</param>
         /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
-        /// <param name="newVersionNumber">The new GlobalVersionNumber to store in the _globalStateTable for this _userTable</param>
-        /// <param name="userTableId">Used to identify the user table</param>
-        /// <param name="workerTableName">The name of worker table </param>
+        /// <param name="newLastSyncVersion">The new LastSyncVersion to store in the _globalStateTable for this _userTableName</param>
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
-        private SqlCommand BuildUpdateGlobalStateTableCommand(SqlConnection connection, SqlTransaction transaction, long newVersionNumber, int userTableId, string workerTableName)
+        private SqlCommand BuildUpdateTablesPostInvocation(SqlConnection connection, SqlTransaction transaction, long newLastSyncVersion)
         {
-            if (connection is null)
-            {
-                throw new ArgumentNullException(nameof(connection));
-            }
-            if (transaction is null)
-            {
-                throw new ArgumentNullException(nameof(transaction));
-            }
+            string workerTableJoinCondition = string.Join(" AND ", this._primaryKeyColumns.Select(col => $"c.{col} = w.{col}"));
 
-            string leftOuterJoinWorkerTable = string.Join(" AND ", this._primaryKeys.Keys.Select(key => $"c.{key} = w.{key}"));
+            // TODO: Need to think through all cases to ensure the query below is correct, especially with use of < vs <=.
+            string updateTablesPostInvocationQuery = $@"
+                DECLARE @current_last_sync_version bigint;
+                SELECT @current_last_sync_version = LastSyncVersion
+                FROM {SqlTriggerConstants.GlobalStateTableName}
+                WHERE UserFunctionID = '{this._userFunctionId}' AND UserTableID = {this._userTableId};
 
-            string updateGlobalStateTableCommand = $@"
-                DECLARE @current_version bigint;
                 DECLARE @unprocessed_changes bigint;
-                SELECT @current_version = GlobalVersionNumber FROM {this._globalStateTable} WHERE UserTableID = {userTableId} AND WorkerID = '{this._workerId}';
+                SELECT @unprocessed_changes = COUNT(*) FROM (
+                    SELECT c.SYS_CHANGE_VERSION
+                    FROM CHANGETABLE(CHANGES {this._userTableName}, @current_last_sync_version) AS c
+                    LEFT OUTER JOIN {this._workerTableName} AS w WITH (TABLOCKX) ON {workerTableJoinCondition}
+                    WHERE
+                        c.SYS_CHANGE_VERSION <= {newLastSyncVersion} AND
+                        w.AttemptCount <= {MaxAttemptCount} AND
+                        (w.ChangeVersion != c.SYS_CHANGE_VERSION OR w.LeaseExpirationTime IS NOT NULL);
 
-                SELECT @unprocessed_changes = COUNT(*) FROM
-                    (SELECT c.SYS_CHANGE_VERSION FROM CHANGETABLE(CHANGES {this._userTable}, @current_version) AS c
-                    LEFT OUTER JOIN {workerTableName} AS w with (TABLOCKX) ON {leftOuterJoinWorkerTable}
-                    WHERE c.SYS_CHANGE_VERSION <= {newVersionNumber}
-                    AND ((w.VersionNumber IS NULL OR w.VersionNumber != c.SYS_CHANGE_VERSION OR w.LeaseExpirationTime IS NOT NULL)
-                    AND (w.DequeueCount IS NULL OR w.DequeueCount < {MaxDequeueCount}))) AS Changes;
-
-                IF @unprocessed_changes = 0 AND {newVersionNumber} > @current_version
+                IF @unprocessed_changes = 0 AND @current_last_sync_version < {newLastSyncVersion}
                 BEGIN
-                    UPDATE {this._globalStateTable} SET GlobalVersionNumber = {newVersionNumber} WHERE UserTableID = {userTableId} AND WorkerID = '{this._workerId}';
-                    DELETE FROM {workerTableName} with (TABLOCKX) WHERE VersionNumber <= {newVersionNumber};
+                    UPDATE {SqlTriggerConstants.GlobalStateTableName}
+                    SET LastSyncVersion = {newLastSyncVersion}
+                    WHERE UserFunctionID = '{this._userFunctionId}' AND UserTableID = {this._userTableId};
+
+                    DELETE FROM {this._workerTableName} WITH (TABLOCKX) WHERE ChangeVersion <= {newLastSyncVersion};
                 END
             ";
 
-            return new SqlCommand(updateGlobalStateTableCommand, connection, transaction);
+            return new SqlCommand(updateTablesPostInvocationQuery, connection, transaction);
         }
 
         /// <summary>
-        /// Adds the primary key name (first column returned by the reader) and type to the _primaryKeys dictionary.
-        /// Adds length arguments if the type of any of those listed in variableLengthTypes, and precision and 
-        /// scale arguments if it is any of those listed in variablePrecisionTypes
-        /// Otherwise, if the type accepts arguments (like datetime2), just uses the default which is the highest
-        /// precision for all other types
+        /// Returns SqlCommand with SqlParameters added to it. Each parameter follows the format
+        /// (@PrimaryKey_i, PrimaryKeyValue), where @PrimaryKey is the name of a primary key column, and PrimaryKeyValue
+        /// is one of the row's value for that column. To distinguish between the parameters of different rows, each row
+        /// will have a distinct value of i.
         /// </summary>
-        /// <param name="reader">Contains each primary key name and corresponding type information</param>
-        /// <exception cref="InvalidOperationException">
-        /// Thrown if no primary keys are found for the user table. This could be because the user table does not have
-        /// any primary key columns.
-        /// </exception>
-        private async Task DeterminePrimaryKeyTypesAsync(SqlDataReader reader)
+        /// <param name="commandText">SQL query string</param>
+        /// <param name="connection">The connection to add to the returned SqlCommand</param>
+        /// <param name="transaction">The transaction to add to the returned SqlCommand</param>
+        /// <remarks>
+        /// Ideally, we would have a map that maps from rows to a list of SqlCommands populated with their primary key
+        /// values. The issue with this is that SQL doesn't seem to allow adding parameters to one collection when they
+        /// are part of another. So, for example, since the SqlParameters are part of the list in the map, an exception
+        /// is thrown if they are also added to the collection of a SqlCommand. The expected behavior seems to be to
+        /// rebuild the SqlParameters each time.
+        /// </remarks>
+        private SqlCommand GetSqlCommandWithParameters(string commandText, SqlConnection connection, SqlTransaction transaction)
         {
-            // Necessary in the case that a prior attempt to start the SqlTableChangeMonitor failed.
-            // Could be the case that these were partially populated, so should clear and repopulate them
-            this._primaryKeys.Clear();
+            var command = new SqlCommand(commandText, connection, transaction);
 
-            while (await reader.ReadAsync())
+            for (int index = 0; index < this._rows.Count; index++)
             {
-                string type = reader.GetString(1);
-                if (this.variableLengthTypes.Contains(type))
+                foreach (string col in this._primaryKeyColumns)
                 {
-                    short length = reader.GetInt16(2);
-                    // Special "max" case. I'm actually not sure it's valid to have varchar(max) as a primary key because
-                    // it exceeds the byte limit of an index field (900 bytes), but just in case
-                    if (length == -1)
-                    {
-                        type += "(max)";
-                    }
-                    else
-                    {
-                        type += "(" + length + ")";
-                    }
-                }
-                else if (this.variablePrecisionTypes.Contains(type))
-                {
-                    int precision = reader.GetByte(3);
-                    int scale = reader.GetByte(4);
-                    type += "(" + precision + "," + scale + ")";
-                }
-                this._primaryKeys.Add(reader.GetString(0), type);
-            }
-
-            if (this._primaryKeys.Count == 0)
-            {
-                throw new InvalidOperationException($"Unable to determine the primary keys of user table {this._userTable}. Potentially, the table does not have any primary " +
-                    $"key columns. A primary key is required for every user table for which changes are being monitored.");
-            }
-        }
-
-        /// <summary>
-        /// Builds up the list of SqlChangeTrackingEntries passed to the user's triggered function based on the data
-        /// stored in "_rows"
-        /// If any of the entries correspond to a deleted row, then the <see cref="SqlChangeTrackingEntry.Data"> will be populated
-        /// with only the primary key values of the deleted row.
-        /// </summary>
-        /// <returns>The list of entries</returns>
-        private IEnumerable<SqlChangeTrackingEntry<T>> GetSqlChangeTrackingEntries()
-        {
-            var entries = new List<SqlChangeTrackingEntry<T>>();
-            foreach (Dictionary<string, string> row in this._rows)
-            {
-                SqlChangeType changeType = GetChangeType(row);
-                // If the row has been deleted, there is no longer any data for it in the user table. The best we can do
-                // is populate the entry with the primary key values of the row
-                if (changeType == SqlChangeType.Delete)
-                {
-                    entries.Add(new SqlChangeTrackingEntry<T>(changeType, JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(this.BuildDefaultDictionary(row)))));
-                }
-                else
-                {
-                    var userTableRow = new Dictionary<string, string>();
-                    foreach (string col in this._userTableColumns)
-                    {
-                        row.TryGetValue(col, out string colVal);
-                        userTableRow.Add(col, colVal);
-                    }
-                    entries.Add(new SqlChangeTrackingEntry<T>(GetChangeType(row), JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(userTableRow))));
+                    command.Parameters.Add(new SqlParameter($"@{col}_{index}", this._rows[index][col]));
                 }
             }
-            return entries;
-        }
 
-        /// <summary>
-        /// Gets the change associated with this row (either an insert, update or delete)
-        /// </summary>
-        /// <param name="row">
-        /// The (combined) row from the change table and worker table
-        /// </param>
-        /// <exception cref="ArgumentException">
-        /// Thrown if "row" does not contain the column "SYS_CHANGE_OPERATION"
-        /// </exception>
-        /// <exception cref="InvalidDataException">
-        /// Thrown if the value of the "SYS_CHANGE_OPERATION" column is none of "I", "U", or "D"
-        /// </exception>
-        /// <returns>
-        /// SqlChangeType.Insert for an insert, SqlChangeType.Update for an update,
-        /// and SqlChangeType.Delete for a delete 
-        /// </returns>
-        private static SqlChangeType GetChangeType(Dictionary<string, string> row)
-        {
-            if (!row.TryGetValue("SYS_CHANGE_OPERATION", out string changeType))
-            {
-                throw new ArgumentException($"Row does not contain the column SYS_CHANGE_OPERATION from SQL's change table: {row}");
-            }
-            if (changeType.Equals("I", StringComparison.Ordinal))
-            {
-                return SqlChangeType.Insert;
-            }
-            else if (changeType.Equals("U", StringComparison.Ordinal))
-            {
-                return SqlChangeType.Update;
-            }
-            else if (changeType.Equals("D", StringComparison.Ordinal))
-            {
-                return SqlChangeType.Delete;
-            }
-            else
-            {
-                throw new InvalidDataException($"Invalid change type encountered in change table row: {row}");
-            }
-        }
-
-        /// <summary>
-        /// Builds up a default POCO in which only the fields corresponding to the primary keys are populated
-        /// </summary>
-        /// <param name="row">
-        /// Contains the values of the primary keys that the POCO is populated with
-        /// </param>
-        /// <returns>The default POCO</returns>
-        private Dictionary<string, string> BuildDefaultDictionary(Dictionary<string, string> row)
-        {
-            var defaultDictionary = new Dictionary<string, string>();
-            foreach (string primaryKey in this._primaryKeys.Keys)
-            {
-                row.TryGetValue(primaryKey, out string primaryKeyValue);
-                defaultDictionary.Add(primaryKey, primaryKeyValue);
-            }
-            return defaultDictionary;
-        }
-
-        /// <summary>
-        /// Calculates the new version number to attempt to update GlobalVersionNumber in global state table to
-        /// If all version numbers in _rows are the same, use that version number
-        /// If they aren't, use the second largest version number
-        /// For an explanation as to why this method was chosen, see 9c in Steps of Operation in this design doc:
-        /// https://microsoft-my.sharepoint.com/:w:/p/t-sotevo/EQdANWq9ZWpKm8e48TdzUwcBGZW07vJmLf8TL_rtEG8ixQ?e=owN2EX
-        /// </summary>
-        private long CalculateNewVersionNumber()
-        {
-            var versionNumbers = new SortedSet<long>();
-            foreach (Dictionary<string, string> row in this._rows)
-            {
-                row.TryGetValue("SYS_CHANGE_VERSION", out string versionNumberString);
-                versionNumbers.Add(long.Parse(versionNumberString, CultureInfo.InvariantCulture));
-            }
-
-            // If there are at least two version numbers in this set, return the second highest one
-            if (versionNumbers.Count > 1)
-            {
-                return versionNumbers.ElementAt(versionNumbers.Count - 2);
-            }
-            // Otherwise, return the only version number in the set
-            else
-            {
-                return versionNumbers.ElementAt(0);
-            }
+            return command;
         }
 
         private enum State
         {
             CheckingForChanges,
-            ProcessingChanges
-        }
-
-        /// <summary>
-        /// Returns the OBJECT_ID of userTable
-        /// </summary>
-        /// <param name="connectionString">The SQL connection string used to establish a connection to the user's database</param>
-        /// <param name="userTable">The (sanitized) name of the user table</param>
-        /// <exception cref="InvalidOperationException">
-        /// Thrown if the query to retrieve the OBJECT_ID of the user table fails to correctly execute
-        /// This can happen if the OBJECT_ID call returns NULL, meaning that the user table might not exist in the database
-        /// </exception>
-        private static async Task<int> GetUserTableIDAsync(string connectionString, string userTable)
-        {
-            string getObjectIDQuery = $"SELECT OBJECT_ID(N\'{userTable}\', \'U\');";
-
-            using (var connection = new SqlConnection(connectionString))
-            {
-                await connection.OpenAsync();
-                // Don't think I need a transaction for this since I'm just reading data
-                using var getObjectIDCommand = new SqlCommand(getObjectIDQuery, connection);
-                using SqlDataReader reader = await getObjectIDCommand.ExecuteReaderAsync();
-                if (await reader.ReadAsync())
-                {
-                    object userTableID = reader.GetValue(0);
-                    // Call to OBJECT_ID returned null
-                    if (userTableID is DBNull)
-                    {
-                        throw new InvalidOperationException($"Failed to determine the OBJECT_ID of the user table {userTable}. " +
-                            $"Possibly {userTable} does not exist in the database.");
-                    }
-                    else
-                    {
-                        return (int)userTableID;
-                    }
-                }
-            }
-            throw new InvalidOperationException($"Failed to determine the OBJECT_ID of the user table {userTable}");
-        }
-
-        public void Dispose()
-        {
-            throw new NotImplementedException();
+            ProcessingChanges,
         }
     }
 }

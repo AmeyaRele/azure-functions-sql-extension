@@ -25,7 +25,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     internal sealed class SqlTriggerBinding<T> : ITriggerBinding
     {
         private readonly string _connectionString;
-        private readonly string _table;
+        private readonly string _tableName;
         private readonly ParameterInfo _parameter;
         private readonly IHostIdProvider _hostIdProvider;
         private readonly ILogger _logger;
@@ -34,11 +34,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <summary>
         /// Initializes a new instance of the <see cref="SqlTriggerBinding<typeparamref name="T"/>"/> class.
         /// </summary>
+        /// <param name="tableName">
+        /// The name of the user table that changes are being tracked on
+        /// </param>
         /// <param name="connectionString">
         /// The SQL connection string used to connect to the user's database
-        /// </param>
-        /// <param name="table"> 
-        /// The name of the user table that changes are being tracked on
         /// </param>
         /// <param name="parameter">
         /// The parameter that contains the SqlTriggerAttribute of the user's function
@@ -49,9 +49,9 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <exception cref="ArgumentNullException">
         /// Thrown if any of the parameters are null
         /// </exception>
-        public SqlTriggerBinding(string table, string connectionString, ParameterInfo parameter, IHostIdProvider hostIdProvider, ILogger logger)
+        public SqlTriggerBinding(string tableName, string connectionString, ParameterInfo parameter, IHostIdProvider hostIdProvider, ILogger logger)
         {
-            this._table = table ?? throw new ArgumentNullException(nameof(table));
+            this._tableName = tableName ?? throw new ArgumentNullException(nameof(tableName));
             this._connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
             this._parameter = parameter ?? throw new ArgumentNullException(nameof(parameter));
             this._hostIdProvider = hostIdProvider ?? throw new ArgumentNullException(nameof(hostIdProvider));
@@ -96,7 +96,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 { "SqlTrigger", changeData }
             };
 
-            return Task.FromResult<ITriggerData>(new TriggerData(new SimpleValueProvider(this._parameter.ParameterType, changeData, this._table), bindingData));
+            return Task.FromResult<ITriggerData>(new TriggerData(new SimpleValueProvider(this._parameter.ParameterType, changeData, this._tableName), bindingData));
         }
 
         /// <summary>
@@ -118,8 +118,8 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 throw new ArgumentNullException(nameof(context), "Missing listener context");
             }
 
-            string workerId = await this.GetWorkerIdAsync();
-            return new SqlTriggerListener<T>(this._table, this._connectionString, workerId, context.Executor, this._logger);
+            string userFunctionId = await this.GetUserFunctionIdAsync();
+            return new SqlTriggerListener<T>(this._connectionString, this._tableName, userFunctionId, context.Executor, this._logger);
         }
 
         /// <returns> A description of the SqlTriggerParameter (<see cref="SqlTriggerParameterDescriptor"/> </returns>
@@ -129,21 +129,21 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             {
                 Name = this._parameter.Name,
                 Type = "SqlTrigger",
-                TableName = _table
+                TableName = _tableName
             };
         }
 
-        private async Task<string> GetWorkerIdAsync()
+        private async Task<string> GetUserFunctionIdAsync()
         {
             string hostId = await this._hostIdProvider.GetHostIdAsync(CancellationToken.None);
 
-            using var sha256 = SHA256.Create();
             var methodInfo = (MethodInfo)this._parameter.Member;
             string functionName = $"{methodInfo.DeclaringType.FullName}.{methodInfo.Name}";
-            byte[] functionHash = sha256.ComputeHash(Encoding.UTF8.GetBytes(functionName));
-            string functionId = new Guid(functionHash.Take(16).ToArray()).ToString("N")[..8];
 
-            return $"{hostId}_{functionId}";
+            using var sha256 = SHA256.Create();
+            byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(hostId + functionName));
+
+            return new Guid(hash.ToArray()).ToString("N")[..16];
         }
 
         /// <summary>

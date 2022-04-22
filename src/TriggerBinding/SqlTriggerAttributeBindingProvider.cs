@@ -80,11 +80,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                     $" is supported, where T is a user-defined POCO that matches the schema of the tracked table");
             }
 
+            string connectionString = SqlBindingUtilities.GetConnectionString(attribute.ConnectionStringSetting, this._configuration);
+
             Type type = parameter.ParameterType.GetGenericArguments()[0].GetGenericArguments()[0];
             Type typeOfTriggerBinding = typeof(SqlTriggerBinding<>).MakeGenericType(type);
-            ConstructorInfo constructor = typeOfTriggerBinding.GetConstructor(new Type[] { typeof(string), typeof(string), typeof(ParameterInfo), typeof(IHostIdProvider), typeof(ILogger) });
-            return Task.FromResult((ITriggerBinding)constructor.Invoke(new object[] {attribute.TableName,
-                SqlBindingUtilities.GetConnectionString(attribute.ConnectionStringSetting, this._configuration), parameter, this._hostIdProvider, this._logger }));
+            ConstructorInfo constructor = typeOfTriggerBinding.GetConstructor(
+                new Type[] { typeof(string), typeof(string), typeof(ParameterInfo), typeof(IHostIdProvider), typeof(ILogger) });
+
+            return Task.FromResult((ITriggerBinding)constructor.Invoke(
+                new object[] { attribute.TableName, connectionString, parameter, this._hostIdProvider, this._logger }));
         }
 
         /// <summary>
