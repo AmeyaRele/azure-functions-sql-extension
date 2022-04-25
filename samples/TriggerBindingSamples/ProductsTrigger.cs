@@ -1,4 +1,4 @@
-// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Collections.Generic;
@@ -15,7 +15,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Samples.TriggerBindingSamples
             IEnumerable<SqlChangeTrackingEntry<Product>> changes,
             ILogger logger)
         {
-            foreach (var change in changes)
+            foreach (SqlChangeTrackingEntry<Product> change in changes)
             {
                 Product product = change.Data;
                 logger.LogInformation($"Change occurred to Products table row: {change.ChangeType}");
