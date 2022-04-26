@@ -242,7 +242,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             string createSchemaQuery = $@"
                 IF SCHEMA_ID(N'{SqlTriggerConstants.SchemaName}') IS NULL
-                    CREATE SCHEMA {SqlTriggerConstants.SchemaName};
+                    EXEC ('CREATE SCHEMA [{SqlTriggerConstants.SchemaName}]');
             ";
 
             using var createSchemaCommand = new SqlCommand(createSchemaQuery, connection, transaction);

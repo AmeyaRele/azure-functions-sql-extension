@@ -10,7 +10,6 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     /// <typeparam name="T">A user-defined POCO that represents a row of the table</typeparam>
     public sealed class SqlChange<T>
     {
-
         /// <summary>
         /// Initializes a new instance of the <see cref="SqlChange{T}"/> class.
         /// </summary>
