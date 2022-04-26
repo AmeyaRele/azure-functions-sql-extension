@@ -12,13 +12,13 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Samples.TriggerBindingSamples
         [FunctionName("ProductsTrigger")]
         public static void Run(
             [SqlTrigger("[dbo].[Products]", ConnectionStringSetting = "SqlConnectionString")]
-            IEnumerable<SqlChangeTrackingEntry<Product>> changes,
+            IReadOnlyList<SqlChange<Product>> changes,
             ILogger logger)
         {
-            foreach (SqlChangeTrackingEntry<Product> change in changes)
+            foreach (SqlChange<Product> change in changes)
             {
-                Product product = change.Data;
-                logger.LogInformation($"Change occurred to Products table row: {change.ChangeType}");
+                Product product = change.Item;
+                logger.LogInformation($"Change occurred to Products table row: {change.Operation}");
                 logger.LogInformation($"ProductID: {product.ProductID}, Name: {product.Name}, Cost: {product.Cost}");
             }
         }

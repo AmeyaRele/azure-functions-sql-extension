@@ -32,7 +32,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         private static readonly IReadOnlyDictionary<string, Type> _emptyBindingContract = new Dictionary<string, Type>();
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="SqlTriggerBinding<typeparamref name="T"/>"/> class.
+        /// Initializes a new instance of the <see cref="SqlTriggerBinding{T}"/> class.
         /// </summary>
         /// <param name="tableName">
         /// The name of the user table that changes are being tracked on
@@ -61,7 +61,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <summary>
         /// Gets the type of the value the Trigger receives from the Executor.
         /// </summary>
-        public Type TriggerValueType => typeof(IEnumerable<SqlChangeTrackingEntry<T>>);
+        public Type TriggerValueType => typeof(IReadOnlyList<SqlChange<T>>);
 
         /// <summary>
         /// Returns an empty binding contract. The type that SqlTriggerAttribute is bound to is checked in 
@@ -70,33 +70,33 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         public IReadOnlyDictionary<string, Type> BindingDataContract => _emptyBindingContract;
 
         /// <summary>
-        /// Binds the list of <see cref="SqlChangeTrackingEntry<typeparamref name="T"/>"/> represented by "value" with a <see cref="SimpleValueProvider"/>
-        /// which (as the name suggests) simply returns "value" 
+        /// Binds the list of <see cref="SqlChange{T}"/> represented by "value" with a <see cref="SimpleValueProvider"/>
+        /// which (as the name suggests) simply returns "value".
         /// <param name="value">
-        /// The list of <see cref="SqlChangeTrackingEntry<typeparamref name="T"/>"/> data
+        /// The list of <see cref="SqlChange{T}"/> data.
         /// </param>
         /// <param name="context">
         /// Unused
         /// </param>
         /// <exception cref="InvalidOperationException">
-        /// Thrown if "value" is not of type IEnumerable<SqlChangeTrackingEntry<typeparamref name="T"/>>
+        /// Thrown if "value" is not of type IReadOnlyList<SqlChange<T>>.
         /// </exception>
         /// <returns>
-        /// The ITriggerData which stores the list of change tracking entries as well as the SimpleValueBinder
+        /// The ITriggerData which stores the list of SQL table changes as well as the SimpleValueBinder
         /// </returns>
         public Task<ITriggerData> BindAsync(object value, ValueBindingContext context)
         {
-            if (!(value is IEnumerable<SqlChangeTrackingEntry<T>> changeData))
+            if (!(value is IReadOnlyList<SqlChange<T>> changes))
             {
-                throw new InvalidOperationException("The value passed to the SqlTrigger BindAsync must be of type IEnumerable<SqlChangeTrackingEntry<T>>");
+                throw new InvalidOperationException("The value passed to the SqlTrigger BindAsync must be of type IReadOnlyList<SqlChange<T>>");
             }
 
             var bindingData = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
             {
-                { "SqlTrigger", changeData }
+                { "SqlTrigger", changes }
             };
 
-            return Task.FromResult<ITriggerData>(new TriggerData(new SimpleValueProvider(this._parameter.ParameterType, changeData, this._tableName), bindingData));
+            return Task.FromResult<ITriggerData>(new TriggerData(new SimpleValueProvider(this._parameter.ParameterType, changes, this._tableName), bindingData));
         }
 
         /// <summary>
@@ -162,7 +162,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             }
 
             /// <summary>
-            /// Returns the type that the trigger binding is bound to (IEnumerable<SqlChangeTrackingEntry<typeparamref name="T"/>>)
+            /// Returns the type that the trigger binding is bound to (IReadOnlyList{SqlChange{T}}"/>>)
             /// </summary>
             public Type Type { get; }
 

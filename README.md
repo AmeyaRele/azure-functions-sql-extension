@@ -301,13 +301,13 @@ This tutorial requires that the Azure SQL database is setup as shown in [Create 
             [FunctionName("EmployeeTrigger")]
             public static void Run(
                 [SqlTrigger("[dbo].[Employees]", ConnectionStringSetting = "SqlConnectionString")]
-                IEnumerable<SqlChangeTrackingEntry<Employee>> changes,
+                IReadOnlyList<SqlChange<Employee>> changes,
                 ILogger logger)
             {
                 foreach (var change in changes)
                 {
-                    Employee employee = change.Data;
-                    logger.LogInformation($"Change occurred to Employee table row: {change.ChangeType}");
+                    Employee employee = change.Item;
+                    logger.LogInformation($"Change occurred to Employee table row: {change.Operation}");
                     logger.LogInformation($"EmployeeID: {employee.EmployeeId}, FirstName: {employee.FirstName}, LastName: {employee.LastName}, Company: {employee.Company}, Team: {employee.Team}");
                 }
             }
@@ -622,7 +622,7 @@ The trigger takes two arguments
 
 The following are valid binding types for trigger
 
-- **IEnumerable<SqlChangeTrackingEntry\<T\>>**: Each element is a `SqlChangeTrackingEntry`, which stores change metadata about a modified row in the user table as well as the row itself. In the case that the row was deleted, only the primary key values of the row are populated. The user table row is represented by `T`, where `T` is a user-defined POCO, or Plain Old C# Object. `T` should follow the structure of a row in the queried table. See the [Query String](#query-string) section for an example of what `T` should look like. The two fields of a `SqlChangeTrackingEntry` are the `Data` field of type `T` which stores the row, and the `ChangeType` field of type `SqlChangeType` which indicates the type of operaton done to the row (either an insert, update, or delete).
+- **IReadOnlyList<SqlChange\<T\>>**: Each element is a `SqlChange`, which stores change metadata about a modified row in the user table as well as the row itself. In the case that the row was deleted, only the primary key values of the row are populated. The user table row is represented by `T`, where `T` is a user-defined POCO, or Plain Old C# Object. `T` should follow the structure of a row in the queried table. See the [Query String](#query-string) section for an example of what `T` should look like. The two fields of a `SqlChange` are the `Item` field of type `T` which stores the row, and the `Operation` field of type `SqlChangeOperation` which indicates the type of operaton done to the row (either an insert, update, or delete).
 
 Any time changes happen to the "Products" table, the function is triggered with a list of changes that occurred. The changes are processed sequentially, so the function will be triggered by the earliest changes first.
 
@@ -630,13 +630,13 @@ Any time changes happen to the "Products" table, the function is triggered with 
 [FunctionName("ProductsTrigger")]
 public static void Run(
     [SqlTrigger("Products", ConnectionStringSetting = "SqlConnectionString")]
-    IEnumerable<SqlChangeTrackingEntry<Product>> changes,
+    IReadOnlyList<SqlChange<Product>> changes,
     ILogger logger)
 {
     foreach (var change in changes)
     {
-        Product product = change.Data;
-        logger.LogInformation($"Change occurred to Products table row: {change.ChangeType}");
+        Product product = change.Item;
+        logger.LogInformation($"Change occurred to Products table row: {change.Operation}");
         logger.LogInformation($"ProductID: {product.ProductID}, Name: {product.Name}, Price: {product.Cost}");
     }
 }

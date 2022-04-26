@@ -239,15 +239,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             if (this._rows.Count > 0)
             {
                 this._state = State.ProcessingChanges;
-                IReadOnlyList<SqlChangeTrackingEntry<T>> entries = null;
+                IReadOnlyList<SqlChange<T>> changes = null;
 
                 try
                 {
                     // What should we do if this fails? It doesn't make sense to retry since it's not a connection based
-                    // thing. We could still try to trigger on the correctly processed entries, but that adds additional
-                    // complication because we don't want to release the leases on the incorrectly processed entries.
+                    // thing. We could still try to trigger on the correctly processed changes, but that adds additional
+                    // complication because we don't want to release the leases on the incorrectly processed changes.
                     // For now, just give up I guess?
-                    entries = this.GetSqlChangeTrackingEntries();
+                    changes = this.GetChanges();
                 }
                 catch (Exception e)
                 {
@@ -256,10 +256,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                         $"with change metadata due to error: {e.Message}", true);
                 }
 
-                if (entries != null)
+                if (changes != null)
                 {
                     FunctionResult result = await this._executor.TryExecuteAsync(
-                        new TriggeredFunctionData() { TriggerValue = entries },
+                        new TriggeredFunctionData() { TriggerValue = changes },
                         this._cancellationTokenSourceExecutor.Token);
 
                     if (result.Succeeded)
@@ -454,28 +454,28 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         }
 
         /// <summary>
-        /// Builds up the list of SqlChangeTrackingEntries passed to the user's triggered function based on the data
-        /// stored in "_rows". If any of the entries correspond to a deleted row, then the <see cref="SqlChangeTrackingEntry.Data">
-        ///  will be populated with only the primary key values of the deleted row.
+        /// Builds up the list of <see cref="SqlChange{T}"/> passed to the user's triggered function based on the data
+        /// stored in "_rows". If any of the changes correspond to a deleted row, then the <see cref="SqlChange.Item">
+        /// will be populated with only the primary key values of the deleted row.
         /// </summary>
-        /// <returns>The list of entries</returns>
-        private IReadOnlyList<SqlChangeTrackingEntry<T>> GetSqlChangeTrackingEntries()
+        /// <returns>The list of changes</returns>
+        private IReadOnlyList<SqlChange<T>> GetChanges()
         {
-            var entries = new List<SqlChangeTrackingEntry<T>>();
+            var changes = new List<SqlChange<T>>();
             foreach (Dictionary<string, string> row in this._rows)
             {
-                SqlChangeType changeType = GetChangeType(row);
+                SqlChangeOperation operation = GetChangeOperation(row);
 
                 // If the row has been deleted, there is no longer any data for it in the user table. The best we can do
-                // is populate the entry with the primary key values of the row.
-                Dictionary<string, string> entry = changeType == SqlChangeType.Delete
+                // is populate the row-item with the primary key values of the row.
+                Dictionary<string, string> item = operation == SqlChangeOperation.Delete
                     ? this._primaryKeyColumns.ToDictionary(col => col, col => row[col])
                     : this._userTableColumns.ToDictionary(col => col, col => row[col]);
 
-                entries.Add(new SqlChangeTrackingEntry<T>(changeType, JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(entry))));
+                changes.Add(new SqlChange<T>(operation, JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(item))));
             }
 
-            return entries;
+            return changes;
         }
 
         /// <summary>
@@ -483,16 +483,16 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// </summary>
         /// <param name="row">The (combined) row from the change table and worker table</param>
         /// <exception cref="InvalidDataException">Thrown if the value of the "SYS_CHANGE_OPERATION" column is none of "I", "U", or "D"</exception>
-        /// <returns>SqlChangeType.Insert for an insert, SqlChangeType.Update for an update, and SqlChangeType.Delete for a delete</returns>
-        private static SqlChangeType GetChangeType(Dictionary<string, string> row)
+        /// <returns>SqlChangeOperation.Insert for an insert, SqlChangeOperation.Update for an update, and SqlChangeOperation.Delete for a delete</returns>
+        private static SqlChangeOperation GetChangeOperation(Dictionary<string, string> row)
         {
-            string changeType = row["SYS_CHANGE_OPERATION"];
+            string operation = row["SYS_CHANGE_OPERATION"];
 
-            return changeType switch
+            return operation switch
             {
-                "I" => SqlChangeType.Insert,
-                "U" => SqlChangeType.Update,
-                "D" => SqlChangeType.Delete,
+                "I" => SqlChangeOperation.Insert,
+                "U" => SqlChangeOperation.Update,
+                "D" => SqlChangeOperation.Delete,
                 _ => throw new InvalidDataException($"Invalid change type encountered in change table row: {row}"),
             };
         }

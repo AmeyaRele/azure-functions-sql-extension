@@ -2,7 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Executors;
@@ -52,7 +52,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// Thrown if context is null
         /// </exception>
         /// <exception cref="InvalidOperationException">
-        /// If the SqlTriggerAttribute is bound to an invalid Type. Currently only IEnumerable<SqlChangeTrackingEntry<T>> 
+        /// If the SqlTriggerAttribute is bound to an invalid Type. Currently only IReadOnlyList<SqlChange<T>> 
         /// is supported, where T is a user-defined POCO representing a row of their table
         /// </exception>
         /// <returns>
@@ -76,8 +76,9 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
             if (!IsValidType(parameter.ParameterType))
             {
-                throw new InvalidOperationException($"Can't bind SqlTriggerAttribute to type {parameter.ParameterType}. Only IEnumerable<SqlChangeTrackingEntry<T>>" +
-                    $" is supported, where T is a user-defined POCO that matches the schema of the tracked table");
+                throw new InvalidOperationException($"Can't bind SqlTriggerAttribute to type {parameter.ParameterType}." +
+                    " Only IReadOnlyList<SqlChange<T>> is supported, where T is a user-defined POCO that matches the" +
+                    " schema of the tracked table");
             }
 
             string connectionString = SqlBindingUtilities.GetConnectionString(attribute.ConnectionStringSetting, this._configuration);
@@ -92,19 +93,18 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         }
 
         /// <summary>
-        /// Determines if type is a valid Type, Currently only IEnumerable<SqlChangeTrackingEntry<T>> is supported, where
-        /// T is a user-defined POCO representing a row of their table
+        /// Determines if type is a valid Type, Currently only IReadOnlyList<SqlChange<T>> is supported, where T is a
+        /// user-defined POCO representing a row of their table.
         /// </summary>
         /// <param name="type"></param>
         /// <returns>True is type is a valid Type, otherwise false</returns>
         private static bool IsValidType(Type type)
         {
-            Type[] genericArguments = type.GetGenericArguments();
-            if (genericArguments.Length != 1)
-            {
-                return false;
-            }
-            return typeof(IEnumerable).IsAssignableFrom(type) && genericArguments[0].GetGenericTypeDefinition().Equals(typeof(SqlChangeTrackingEntry<>));
+            return
+                type.IsGenericType &&
+                type.GetGenericTypeDefinition() == typeof(IReadOnlyList<>) &&
+                type.GetGenericArguments()[0].IsGenericType &&
+                type.GetGenericArguments()[0].GetGenericTypeDefinition() == typeof(SqlChange<>);
         }
     }
 }
