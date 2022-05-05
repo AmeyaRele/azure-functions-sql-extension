@@ -532,7 +532,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <returns>The SqlCommand populated with the query and appropriate parameters</returns>
         private SqlCommand BuildGetChangesCommand(SqlConnection connection, SqlTransaction transaction)
         {
-            string selectList = string.Join(", ", this._userTableColumns.Select(col => $"u.{col}"));
+            string selectList = string.Join(", ", this._userTableColumns.Select(col => this._primaryKeyColumns.Contains(col) ? $"c.{col}" : $"u.{col}"));
             string userTableJoinCondition = string.Join(" AND ", this._primaryKeyColumns.Select(col => $"c.{col} = u.{col}"));
             string workerTableJoinCondition = string.Join(" AND ", this._primaryKeyColumns.Select(col => $"c.{col} = w.{col}"));
 
