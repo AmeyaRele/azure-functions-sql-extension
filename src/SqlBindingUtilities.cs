@@ -4,7 +4,6 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Linq;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 
@@ -136,11 +135,30 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         /// <summary>
         /// Returns a dictionary where each key is a column name and each value is the SQL row's value for that column
         /// </summary>
-        /// <param name="reader">Used to determine the columns of the table as well as the next SQL row to process</param>
+        /// <param name="reader">
+        /// Used to determine the columns of the table as well as the next SQL row to process
+        /// </param>
+        /// <param name="cols">
+        /// Filled with the columns of the table if empty, otherwise assumed to be populated
+        /// with their names already (used for cacheing so we don't retrieve the column names every time)
+        /// </param>
         /// <returns>The built dictionary</returns>
-        public static IReadOnlyDictionary<string, string> BuildDictionaryFromSqlRow(SqlDataReader reader)
+        public static Dictionary<string, string> BuildDictionaryFromSqlRow(SqlDataReader reader, List<string> cols)
         {
-            return Enumerable.Range(0, reader.FieldCount).ToDictionary(reader.GetName, i => reader.GetValue(i).ToString());
+            if (cols.Count == 0)
+            {
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    cols.Add(reader.GetName(i));
+                }
+            }
+
+            var result = new Dictionary<string, string>();
+            foreach (string col in cols)
+            {
+                result.Add(col, reader[col].ToString());
+            }
+            return result;
         }
 
         /// <summary>

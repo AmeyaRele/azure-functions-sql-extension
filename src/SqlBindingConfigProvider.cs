@@ -18,7 +18,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
     /// Exposes SQL input, output, and trigger bindings
     /// </summary>
     [Extension("sql")]
-    internal sealed class SqlBindingConfigProvider : IExtensionConfigProvider
+    internal class SqlBindingConfigProvider : IExtensionConfigProvider
     {
         private readonly IConfiguration _configuration;
         private readonly IHostIdProvider _hostIdProvider;

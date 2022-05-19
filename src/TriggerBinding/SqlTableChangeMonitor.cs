@@ -207,11 +207,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 using (SqlCommand getChangesCommand = this.BuildGetChangesCommand(connection, transaction))
                 {
                     var rows = new List<IReadOnlyDictionary<string, string>>();
-
+                    var cols = new List<string>();
                     using SqlDataReader reader = await getChangesCommand.ExecuteReaderAsync(token);
                     while (await reader.ReadAsync(token))
                     {
-                        rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader));
+                        rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader, cols));
                     }
 
                     this._rows = rows;
@@ -487,13 +487,12 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         private static SqlChangeOperation GetChangeOperation(Dictionary<string, string> row)
         {
             string operation = row["SYS_CHANGE_OPERATION"];
-
-            return operation switch
+            switch (operation)
             {
-                "I" => SqlChangeOperation.Insert,
-                "U" => SqlChangeOperation.Update,
-                "D" => SqlChangeOperation.Delete,
-                _ => throw new InvalidDataException($"Invalid change type encountered in change table row: {row}"),
+                case "I": return SqlChangeOperation.Insert;
+                case "U": return SqlChangeOperation.Update;
+                case "D": return SqlChangeOperation.Delete;
+                default: throw new InvalidDataException($"Invalid change type encountered in change table row: {row}");
             };
         }
 
