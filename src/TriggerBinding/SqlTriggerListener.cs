@@ -77,35 +77,39 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             if (this._state == State.NotInitialized)
             {
-                using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync(cancellationToken);
+                using (var connection = new SqlConnection(this._connectionString))
+                {
+                    await connection.OpenAsync(cancellationToken);
 
-                int userTableId = await this.GetUserTableIdAsync(connection, cancellationToken);
-                IReadOnlyList<(string name, string type)> primaryKeyColumns = await this.GetPrimaryKeyColumnsAsync(connection, cancellationToken);
-                IReadOnlyList<string> userTableColumns = await this.GetUserTableColumnsAsync(connection, cancellationToken);
+                    int userTableId = await this.GetUserTableIdAsync(connection, cancellationToken);
+                    IReadOnlyList<(string name, string type)> primaryKeyColumns = await this.GetPrimaryKeyColumnsAsync(connection, cancellationToken);
+                    IReadOnlyList<string> userTableColumns = await this.GetUserTableColumnsAsync(connection, cancellationToken);
 
-                string workerTableName = string.Format(CultureInfo.InvariantCulture, SqlTriggerConstants.WorkerTableNameFormat, $"{this._userFunctionId}_{userTableId}");
+                    string workerTableName = string.Format(CultureInfo.InvariantCulture, SqlTriggerConstants.WorkerTableNameFormat, $"{this._userFunctionId}_{userTableId}");
 
-                using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
-                await CreateSchemaAsync(connection, transaction, cancellationToken);
-                await CreateGlobalStateTableAsync(connection, transaction, cancellationToken);
-                await this.InsertGlobalStateTableRowAsync(connection, transaction, userTableId, cancellationToken);
-                await CreateWorkerTablesAsync(connection, transaction, workerTableName, primaryKeyColumns, cancellationToken);
-                await transaction.CommitAsync(cancellationToken);
+                    using (SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead))
+                    {
+                        await CreateSchemaAsync(connection, transaction, cancellationToken);
+                        await CreateGlobalStateTableAsync(connection, transaction, cancellationToken);
+                        await this.InsertGlobalStateTableRowAsync(connection, transaction, userTableId, cancellationToken);
+                        await CreateWorkerTablesAsync(connection, transaction, workerTableName, primaryKeyColumns, cancellationToken);
+                        transaction.Commit();
+                    }
 
-                // TODO: Check if passing cancellation token would be beneficial.
-                this._changeMonitor = new SqlTableChangeMonitor<T>(
-                    this._connectionString,
-                    userTableId,
-                    this._userTableName,
-                    this._userFunctionId,
-                    workerTableName,
-                    userTableColumns,
-                    primaryKeyColumns.Select(col => col.name).ToList(),
-                    this._executor,
-                    this._logger);
+                    // TODO: Check if passing cancellation token would be beneficial.
+                    this._changeMonitor = new SqlTableChangeMonitor<T>(
+                        this._connectionString,
+                        userTableId,
+                        this._userTableName,
+                        this._userFunctionId,
+                        workerTableName,
+                        userTableColumns,
+                        primaryKeyColumns.Select(col => col.name).ToList(),
+                        this._executor,
+                        this._logger);
 
-                this._state = State.Running;
+                    this._state = State.Running;
+                }
             }
         }
 
@@ -134,24 +138,28 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             string getObjectIdQuery = $"SELECT OBJECT_ID(N'{this._userTableName}', 'U');";
 
-            using var getObjectIdCommand = new SqlCommand(getObjectIdQuery, connection);
-            using SqlDataReader reader = await getObjectIdCommand.ExecuteReaderAsync(cancellationToken);
-
-            // TODO: Check if the below if-block ever gets hit.
-            if (!await reader.ReadAsync(cancellationToken))
+            using (var getObjectIdCommand = new SqlCommand(getObjectIdQuery, connection))
             {
-                throw new InvalidOperationException($"Failed to determine the OBJECT_ID of the user table {this._userTableName}");
+                using (SqlDataReader reader = await getObjectIdCommand.ExecuteReaderAsync(cancellationToken))
+                {
+
+                    // TODO: Check if the below if-block ever gets hit.
+                    if (!await reader.ReadAsync(cancellationToken))
+                    {
+                        throw new InvalidOperationException($"Failed to determine the OBJECT_ID of the user table {this._userTableName}");
+                    }
+
+                    object userTableId = reader.GetValue(0);
+
+                    if (userTableId is DBNull)
+                    {
+                        throw new InvalidOperationException($"Failed to determine the OBJECT_ID of the user table {this._userTableName}. " +
+                            "Possibly the table does not exist in the database.");
+                    }
+
+                    return (int)userTableId;
+                }
             }
-
-            object userTableId = reader.GetValue(0);
-
-            if (userTableId is DBNull)
-            {
-                throw new InvalidOperationException($"Failed to determine the OBJECT_ID of the user table {this._userTableName}. " +
-                    "Possibly the table does not exist in the database.");
-            }
-
-            return (int)userTableId;
         }
 
         /// <summary>
@@ -172,43 +180,47 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID(N'{this._userTableName}', 'U');
             ";
 
-            using var getPrimaryKeyColumnsCommand = new SqlCommand(getPrimaryKeyColumnsQuery, connection);
-            using SqlDataReader reader = await getPrimaryKeyColumnsCommand.ExecuteReaderAsync(cancellationToken);
-
-            string[] variableLengthTypes = new string[] { "varchar", "nvarchar", "nchar", "char", "binary", "varbinary" };
-            string[] variablePrecisionTypes = new string[] { "numeric", "decimal" };
-
-            var primaryKeyColumns = new List<(string name, string type)>();
-
-            while (await reader.ReadAsync(cancellationToken))
+            using (var getPrimaryKeyColumnsCommand = new SqlCommand(getPrimaryKeyColumnsQuery, connection))
             {
-                string type = reader.GetString(1);
-
-                if (variableLengthTypes.Contains(type))
+                using (SqlDataReader reader = await getPrimaryKeyColumnsCommand.ExecuteReaderAsync(cancellationToken))
                 {
-                    // Special "max" case. I'm actually not sure it's valid to have varchar(max) as a primary key because
-                    // it exceeds the byte limit of an index field (900 bytes), but just in case
-                    short length = reader.GetInt16(2);
-                    type += length == -1 ? "(max)" : $"({length})";
+
+                    string[] variableLengthTypes = new string[] { "varchar", "nvarchar", "nchar", "char", "binary", "varbinary" };
+                    string[] variablePrecisionTypes = new string[] { "numeric", "decimal" };
+
+                    var primaryKeyColumns = new List<(string name, string type)>();
+
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                        string type = reader.GetString(1);
+
+                        if (variableLengthTypes.Contains(type))
+                        {
+                            // Special "max" case. I'm actually not sure it's valid to have varchar(max) as a primary key because
+                            // it exceeds the byte limit of an index field (900 bytes), but just in case
+                            short length = reader.GetInt16(2);
+                            type += length == -1 ? "(max)" : $"({length})";
+                        }
+                        else if (variablePrecisionTypes.Contains(type))
+                        {
+                            byte precision = reader.GetByte(3);
+                            byte scale = reader.GetByte(4);
+                            type += $"({precision},{scale})";
+                        }
+
+                        primaryKeyColumns.Add((name: reader.GetString(0), type));
+                    }
+
+                    if (primaryKeyColumns.Count == 0)
+                    {
+                        throw new InvalidOperationException($"Unable to determine the primary keys of user table {this._userTableName}. " +
+                            "Potentially, the table does not have any primary key columns. A primary key is required for every " +
+                            "user table for which changes are being monitored.");
+                    }
+
+                    return primaryKeyColumns;
                 }
-                else if (variablePrecisionTypes.Contains(type))
-                {
-                    byte precision = reader.GetByte(3);
-                    byte scale = reader.GetByte(4);
-                    type += $"({precision},{scale})";
-                }
-
-                primaryKeyColumns.Add((name: reader.GetString(0), type));
             }
-
-            if (primaryKeyColumns.Count == 0)
-            {
-                throw new InvalidOperationException($"Unable to determine the primary keys of user table {this._userTableName}. " +
-                    "Potentially, the table does not have any primary key columns. A primary key is required for every " +
-                    "user table for which changes are being monitored.");
-            }
-
-            return primaryKeyColumns;
         }
 
         /// <summary>
@@ -222,17 +234,21 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                 WHERE object_id = OBJECT_ID(N'{this._userTableName}', 'U');
             ";
 
-            using var getUserTableColumnsCommand = new SqlCommand(getUserTableColumnsQuery, connection);
-            using SqlDataReader reader = await getUserTableColumnsCommand.ExecuteReaderAsync(cancellationToken);
-
-            var userTableColumns = new List<string>();
-
-            while (await reader.ReadAsync(cancellationToken))
+            using (var getUserTableColumnsCommand = new SqlCommand(getUserTableColumnsQuery, connection))
             {
-                userTableColumns.Add(reader.GetString(0));
-            }
+                using (SqlDataReader reader = await getUserTableColumnsCommand.ExecuteReaderAsync(cancellationToken))
+                {
 
-            return userTableColumns;
+                    var userTableColumns = new List<string>();
+
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                        userTableColumns.Add(reader.GetString(0));
+                    }
+
+                    return userTableColumns;
+                }
+            }
         }
 
         /// <summary>
@@ -245,8 +261,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                     EXEC ('CREATE SCHEMA [{SqlTriggerConstants.SchemaName}]');
             ";
 
-            using var createSchemaCommand = new SqlCommand(createSchemaQuery, connection, transaction);
-            await createSchemaCommand.ExecuteNonQueryAsync(cancellationToken);
+            using (var createSchemaCommand = new SqlCommand(createSchemaQuery, connection, transaction))
+            {
+                await createSchemaCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
         }
 
         /// <summary>
@@ -264,8 +282,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                     );
             ";
 
-            using var createGlobalStateTableCommand = new SqlCommand(createGlobalStateTableQuery, connection, transaction);
-            await createGlobalStateTableCommand.ExecuteNonQueryAsync(cancellationToken);
+            using (var createGlobalStateTableCommand = new SqlCommand(createGlobalStateTableQuery, connection, transaction))
+            {
+                await createGlobalStateTableCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
         }
 
         /// <summary>
@@ -282,23 +302,24 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                     VALUES ('{this._userFunctionId}', {userTableId}, CHANGE_TRACKING_MIN_VALID_VERSION({userTableId}));
             ";
 
-            using var insertRowGlobalStateTableCommand = new SqlCommand(insertRowGlobalStateTableQuery, connection, transaction);
-
-            try
+            using (var insertRowGlobalStateTableCommand = new SqlCommand(insertRowGlobalStateTableQuery, connection, transaction))
             {
-                await insertRowGlobalStateTableCommand.ExecuteNonQueryAsync(cancellationToken);
-            }
-            catch (Exception e)
-            {
-                // Could fail if we try to insert a NULL value into the LastSyncVersion, which happens when
-                // CHANGE_TRACKING_MIN_VALID_VERSION returns NULL for the user table, meaning that change tracking is
-                // not enabled for either the database or table (or both).
+                try
+                {
+                    await insertRowGlobalStateTableCommand.ExecuteNonQueryAsync(cancellationToken);
+                }
+                catch (Exception e)
+                {
+                    // Could fail if we try to insert a NULL value into the LastSyncVersion, which happens when
+                    // CHANGE_TRACKING_MIN_VALID_VERSION returns NULL for the user table, meaning that change tracking is
+                    // not enabled for either the database or table (or both).
 
-                string errorMessage = $"Failed to start processing changes to table {this._userTableName}, " +
-                    $"potentially because change tracking was not enabled for the table or database {connection.Database}.";
+                    string errorMessage = $"Failed to start processing changes to table {this._userTableName}, " +
+                        $"potentially because change tracking was not enabled for the table or database {connection.Database}.";
 
-                this._logger.LogWarning(errorMessage + $" Exact exception thrown is {e.Message}");
-                throw new InvalidOperationException(errorMessage);
+                    this._logger.LogWarning(errorMessage + $" Exact exception thrown is {e.Message}");
+                    throw new InvalidOperationException(errorMessage);
+                }
             }
         }
 
@@ -327,8 +348,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                     );
             ";
 
-            using var createWorkerTableCommand = new SqlCommand(createWorkerTableQuery, connection, transaction);
-            await createWorkerTableCommand.ExecuteNonQueryAsync(cancellationToken);
+            using (var createWorkerTableCommand = new SqlCommand(createWorkerTableQuery, connection, transaction))
+            {
+                await createWorkerTableCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
         }
 
         private enum State

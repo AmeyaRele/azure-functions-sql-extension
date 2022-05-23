@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
 using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Listeners;
@@ -139,10 +140,12 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             var methodInfo = (MethodInfo)this._parameter.Member;
             string functionName = $"{methodInfo.DeclaringType.FullName}.{methodInfo.Name}";
 
-            using var sha256 = SHA256.Create();
-            byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(hostId + functionName));
+            using (var sha256 = SHA256.Create())
+            {
+                byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(hostId + functionName));
 
-            return new Guid(hash[..16]).ToString("N")[..16];
+                return new Guid(hash.Take(16).ToArray()).ToString("N").Substring(0, 16);
+            }
         }
 
         /// <summary>

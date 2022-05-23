@@ -150,19 +150,21 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             {
                 CancellationToken token = this._cancellationTokenSourceCheckForChanges.Token;
 
-                using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync(token);
-
-                while (!token.IsCancellationRequested)
+                using (var connection = new SqlConnection(this._connectionString))
                 {
-                    if (this._state == State.CheckingForChanges)
-                    {
-                        // What should we do if this call gets stuck?
-                        await this.GetChangesAsync(token);
-                        await this.ProcessChangesAsync(token);
-                    }
+                    await connection.OpenAsync(token);
 
-                    await Task.Delay(TimeSpan.FromSeconds(PollingIntervalInSeconds), token);
+                    while (!token.IsCancellationRequested)
+                    {
+                        if (this._state == State.CheckingForChanges)
+                        {
+                            // What should we do if this call gets stuck?
+                            await this.GetChangesAsync(token);
+                            await this.ProcessChangesAsync(token);
+                        }
+
+                        await Task.Delay(TimeSpan.FromSeconds(PollingIntervalInSeconds), token);
+                    }
                 }
             }
             catch (Exception e)
@@ -192,38 +194,62 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
         {
             try
             {
-                using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync(token);
-
-                using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
-
-                // Update the version number stored in the global state table if necessary before using it.
-                using (SqlCommand updateTablesPreInvocationCommand = this.BuildUpdateTablesPreInvocation(connection, transaction))
+                using (var connection = new SqlConnection(this._connectionString))
                 {
-                    await updateTablesPreInvocationCommand.ExecuteNonQueryAsync(token);
-                }
+                    await connection.OpenAsync(token);
 
-                // Use the version number to query for new changes.
-                using (SqlCommand getChangesCommand = this.BuildGetChangesCommand(connection, transaction))
-                {
-                    var rows = new List<IReadOnlyDictionary<string, string>>();
-                    var cols = new List<string>();
-                    using SqlDataReader reader = await getChangesCommand.ExecuteReaderAsync(token);
-                    while (await reader.ReadAsync(token))
+                    using (SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead))
                     {
-                        rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader, cols));
+                        try
+                        {
+                            // Update the version number stored in the global state table if necessary before using it.
+                            using (SqlCommand updateTablesPreInvocationCommand = this.BuildUpdateTablesPreInvocation(connection, transaction))
+                            {
+                                await updateTablesPreInvocationCommand.ExecuteNonQueryAsync(token);
+                            }
+
+                            // Use the version number to query for new changes.
+                            using (SqlCommand getChangesCommand = this.BuildGetChangesCommand(connection, transaction))
+                            {
+                                var rows = new List<IReadOnlyDictionary<string, string>>();
+                                var cols = new List<string>();
+                                using (SqlDataReader reader = await getChangesCommand.ExecuteReaderAsync(token))
+                                {
+                                    while (await reader.ReadAsync(token))
+                                    {
+                                        rows.Add(SqlBindingUtilities.BuildDictionaryFromSqlRow(reader, cols));
+                                    }
+                                }
+
+                                this._rows = rows;
+                            }
+
+                            // If changes were found, acquire leases on them.
+                            if (this._rows.Count > 0)
+                            {
+                                using (SqlCommand acquireLeasesCommand = this.BuildAcquireLeasesCommand(connection, transaction))
+                                {
+                                    await acquireLeasesCommand.ExecuteNonQueryAsync(token);
+                                }
+                            }
+                            transaction.Commit();
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Commit Exception Type: {0}", ex.GetType());
+                            Console.WriteLine("  Message: {0}", ex.Message);
+                            try
+                            {
+                                transaction.Rollback();
+                            }
+                            catch (Exception ex2)
+                            {
+                                Console.WriteLine("Rollback Exception Type: {0}", ex2.GetType());
+                                Console.WriteLine("  Message: {0}", ex2.Message);
+                            }
+                        }
                     }
-
-                    this._rows = rows;
                 }
-
-                // If changes were found, acquire leases on them.
-                if (this._rows.Count > 0)
-                {
-                    using SqlCommand acquireLeasesCommand = this.BuildAcquireLeasesCommand(connection, transaction);
-                    await acquireLeasesCommand.ExecuteNonQueryAsync(token);
-                }
-                await transaction.CommitAsync(token);
             }
             catch (Exception e)
             {
@@ -288,17 +314,19 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
             {
                 CancellationToken token = this._cancellationTokenSourceRenewLeases.Token;
 
-                using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync(token);
-
-                while (!token.IsCancellationRequested)
+                using (var connection = new SqlConnection(this._connectionString))
                 {
-                    await this._rowsLock.WaitAsync(token);
+                    await connection.OpenAsync(token);
 
-                    await this.RenewLeasesAsync(connection, token);
+                    while (!token.IsCancellationRequested)
+                    {
+                        await this._rowsLock.WaitAsync(token);
 
-                    // Want to make sure to renew the leases before they expire, so we renew them twice per lease period.
-                    await Task.Delay(TimeSpan.FromSeconds(LeaseIntervalInSeconds / 2), token);
+                        await this.RenewLeasesAsync(connection, token);
+
+                        // Want to make sure to renew the leases before they expire, so we renew them twice per lease period.
+                        await Task.Delay(TimeSpan.FromSeconds(LeaseIntervalInSeconds / 2), token);
+                    }
                 }
             }
             catch (Exception e)
@@ -325,8 +353,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
                     // I don't think I need a transaction for renewing leases. If this worker reads in a row from the
                     // worker table and determines that it corresponds to its batch of changes, but then that row gets
                     // deleted by a cleanup task, it shouldn't renew the lease on it anyways.
-                    using SqlCommand renewLeasesCommand = this.BuildRenewLeasesCommand(connection);
-                    await renewLeasesCommand.ExecuteNonQueryAsync(token);
+                    using (SqlCommand renewLeasesCommand = this.BuildRenewLeasesCommand(connection))
+                    {
+                        await renewLeasesCommand.ExecuteNonQueryAsync(token);
+                    }
                 }
             }
             catch (Exception e)
@@ -398,24 +428,44 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql
 
             try
             {
-                using var connection = new SqlConnection(this._connectionString);
-                await connection.OpenAsync(token);
-                using SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead);
-
-                // Release the leases held on "_rows".
-                using (SqlCommand releaseLeasesCommand = this.BuildReleaseLeasesCommand(connection, transaction))
+                using (var connection = new SqlConnection(this._connectionString))
                 {
-                    await releaseLeasesCommand.ExecuteNonQueryAsync(token);
-                }
+                    await connection.OpenAsync(token);
+                    using (SqlTransaction transaction = connection.BeginTransaction(System.Data.IsolationLevel.RepeatableRead))
+                    {
+                        try
+                        {
+                            // Release the leases held on "_rows".
+                            using (SqlCommand releaseLeasesCommand = this.BuildReleaseLeasesCommand(connection, transaction))
+                            {
+                                await releaseLeasesCommand.ExecuteNonQueryAsync(token);
+                            }
 
-                // Update the global state table if we have processed all changes with ChangeVersion <= newLastSyncVersion,
-                // and clean up the worker table to remove all rows with ChangeVersion <= newLastSyncVersion.
-                using (SqlCommand updateTablesPostInvocationCommand = this.BuildUpdateTablesPostInvocation(connection, transaction, newLastSyncVersion))
-                {
-                    await updateTablesPostInvocationCommand.ExecuteNonQueryAsync(token);
-                }
+                            // Update the global state table if we have processed all changes with ChangeVersion <= newLastSyncVersion,
+                            // and clean up the worker table to remove all rows with ChangeVersion <= newLastSyncVersion.
+                            using (SqlCommand updateTablesPostInvocationCommand = this.BuildUpdateTablesPostInvocation(connection, transaction, newLastSyncVersion))
+                            {
+                                await updateTablesPostInvocationCommand.ExecuteNonQueryAsync(token);
+                            }
 
-                await transaction.CommitAsync(token);
+                            transaction.Commit();
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Commit Exception Type: {0}", ex.GetType());
+                            Console.WriteLine("  Message: {0}", ex.Message);
+                            try
+                            {
+                                transaction.Rollback();
+                            }
+                            catch (Exception ex2)
+                            {
+                                Console.WriteLine("Rollback Exception Type: {0}", ex2.GetType());
+                                Console.WriteLine("  Message: {0}", ex2.Message);
+                            }
+                        }
+                    }
+                }
 
             }
             catch (Exception e)
