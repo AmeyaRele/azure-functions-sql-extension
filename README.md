@@ -301,13 +301,13 @@ This tutorial requires that the Azure SQL database is setup as shown in [Create 
             [FunctionName("EmployeeTrigger")]
             public static void Run(
                 [SqlTrigger("[dbo].[Employees]", ConnectionStringSetting = "SqlConnectionString")]
-                IEnumerable<SqlChangeTrackingEntry<Employee>> changes,
+                IReadOnlyList<SqlChange<Employee>> changes,
                 ILogger logger)
             {
                 foreach (var change in changes)
                 {
-                    Employee employee = change.Data;
-                    logger.LogInformation($"Change occurred to Employee table row: {change.ChangeType}");
+                    Employee employee = change.Item;
+                    logger.LogInformation($"Change occurred to Employee table row: {change.Operation}");
                     logger.LogInformation($"EmployeeID: {employee.EmployeeId}, FirstName: {employee.FirstName}, LastName: {employee.LastName}, Company: {employee.Company}, Team: {employee.Team}");
                 }
             }
@@ -335,10 +335,10 @@ The following are valid binding types for the result of the query/stored procedu
 
 - **IEnumerable<T>**: Each element is a row of the result represented by `T`, where `T` is a user-defined POCO, or Plain Old C# Object. `T` should follow the structure of a row in the queried table. See the [Query String](#query-string) section for an example of what `T` should look like.
 - **IAsyncEnumerable<T>**: Each element is again a row of the result represented by `T`, but the rows are retrieved "lazily". A row of the result is only retrieved when `MoveNextAsync` is called on the enumerator. This is useful in the case that the query can return a very large amount of rows.
-- **String**: A JSON string representation of the rows of the result (an example is provided [here](https://github.com/Azure/azure-functions-sql-extension/blob/main/samples/InputBindingSamples/GetProductsString.cs)).
-- **SqlCommand**: The SqlCommand is populated with the appropriate query and parameters, but the associated connection is not opened. It is the responsiblity of the user to execute the command and read in the results. This is useful in the case that the user wants more control over how the results are read in. An example is provided [here](https://github.com/Azure/azure-functions-sql-extension/blob/main/samples/InputBindingSamples/GetProductsSqlCommand.cs).
+- **String**: A JSON string representation of the rows of the result (an example is provided [here](https://github.com/Azure/azure-functions-sql-extension/blob/main/samples/samples-csharp/InputBindingSamples/GetProductsString.cs)).
+- **SqlCommand**: The SqlCommand is populated with the appropriate query and parameters, but the associated connection is not opened. It is the responsiblity of the user to execute the command and read in the results. This is useful in the case that the user wants more control over how the results are read in. An example is provided [here](https://github.com/Azure/azure-functions-sql-extension/blob/main/samples/samples-csharp/InputBindingSamples/GetProductsSqlCommand.cs).
 
-The repo contains examples of each of these binding types [here](https://github.com/Azure/azure-functions-sql-extension/tree/main/samples/InputBindingSamples). A few examples are also included below.
+The repo contains examples of each of these binding types [here](https://github.com/Azure/azure-functions-sql-extension/tree/main/samples/samples-csharp/InputBindingSamples). A few examples are also included below.
 
 #### Query String
 
@@ -476,7 +476,7 @@ The following are valid binding types for the rows to be upserted into the table
 - **T**: Used when just one row is to be upserted into the table.
 - **T[]**: Each element is again a row of the result represented by `T`. This output binding type requires manual instantiation of the array in the function.
 
-The repo contains examples of each of these binding types [here](https://github.com/Azure/azure-functions-sql-extension/tree/main/samples/OutputBindingSamples). A few examples are also included below.
+The repo contains examples of each of these binding types [here](https://github.com/Azure/azure-functions-sql-extension/tree/main/samples/samples-csharp/OutputBindingSamples). A few examples are also included below.
 
 #### ICollector<T>/IAsyncCollector<T>
 
@@ -583,8 +583,64 @@ If either of these are false then an error will be thrown.
 
 This changes if one of the primary key columns is an identity column though. In that case there are two options based on how the function defines the output object:
 
-1. If the identity column isn't included in the output object then a straight insert is always performed with the other column values. See [AddProductWithIdentityColumn](./samples/OutputBindingSamples/AddProductWithIdentityColumn.cs) for an example.
-2. If the identity column is included (even if it's an optional nullable value) then a merge is performed similar to what happens when no identity column is present. This merge will either insert a new row or update an existing row based on the existence of a row that matches the primary keys (including the identity column). See [AddProductWithIdentityColumnIncluded](./samples/OutputBindingSamples/AddProductWithIdentityColumnIncluded.cs) for an example.
+1. If the identity column isn't included in the output object then a straight insert is always performed with the other column values. See [AddProductWithIdentityColumn](./samples/samples-csharp/OutputBindingSamples/AddProductWithIdentityColumn.cs) for an example.
+2. If the identity column is included (even if it's an optional nullable value) then a merge is performed similar to what happens when no identity column is present. This merge will either insert a new row or update an existing row based on the existence of a row that matches the primary keys (including the identity column). See [AddProductWithIdentityColumnIncluded](./samples/samples-csharp/OutputBindingSamples/AddProductWithIdentityColumnIncluded.cs) for an example.
+
+### Trigger
+
+#### Change Tracking
+
+The trigger uses SQL's [change tracking functionality](https://docs.microsoft.com/sql/relational-databases/track-changes/about-change-tracking-sql-server?view=sql-server-ver15) to monitor a user table for changes. As such, it is necessary to enable change tracking on the database and table before using the trigger. This can be done in the query editor in the portal. If you need help navigating to it, visit the [Create Azure SQL Database](#Create-Azure-SQL-Database) section in the README.
+
+1. To enable change tracking on the database, run
+
+    ```sql
+    ALTER DATABASE ['your database name']
+    SET CHANGE_TRACKING = ON
+    (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON)
+    ```
+
+    The `CHANGE_RETENTION` parameter specifies for how long changes are kept in the change tracking table. In this case, if a row in a user table hasn't experienced any new changes for two days, it will be removed from the associated change tracking table. The `AUTO_CLEANUP` parameter is used to enable or disable the clean-up task that removes stale data. More information about this command is provided [here](https://docs.microsoft.com/sql/relational-databases/track-changes/enable-and-disable-change-tracking-sql-server?view=sql-server-ver15#enable-change-tracking-for-a-database).
+
+1. To enable change tracking on the table, run
+
+    ```sql
+    ALTER TABLE dbo.Employees
+    ENABLE CHANGE_TRACKING
+    WITH (TRACK_COLUMNS_UPDATED = ON)
+    ```
+
+    The `TRACK_COLUMNS_UPDATED` feature being enabled means that the change tracking table also stores information about what columns where updated in the case of an `UPDATE`. Currently, the trigger does not make use of this additional metadata, though that functionality could be added in the future. More information about this command is provided [here](https://docs.microsoft.com/sql/relational-databases/track-changes/enable-and-disable-change-tracking-sql-server?view=sql-server-ver15#enable-change-tracking-for-a-table).
+
+    The trigger needs to have read access to the table being monitored for changes as well as to the change tracking system tables. It also needs write access to an `az_func` schema within the database, where it will create additional worker tables to process the changes. Each user table will thus have an associated change tracking table and worker table. The worker table will contain roughly as many rows as the change tracking table, and will be cleaned up approximately as often as the change table.
+
+#### Trigger Samples
+The trigger takes two arguments
+
+- **TableName**: Passed as a constructor argument to the binding. Represents the name of the table to be monitored for changes.
+- **ConnectionStringSetting**: Specifies the name of the app setting that contains the SQL connection string used to connect to a database. The connection string must follow the format specified [here](https://docs.microsoft.com/dotnet/api/microsoft.data.sqlclient.sqlconnection.connectionstring?view=sqlclient-dotnet-core-2.0).
+
+The following are valid binding types for trigger
+
+- **IReadOnlyList<SqlChange\<T\>>**: Each element is a `SqlChange`, which stores change metadata about a modified row in the user table as well as the row itself. In the case that the row was deleted, only the primary key values of the row are populated. The user table row is represented by `T`, where `T` is a user-defined POCO, or Plain Old C# Object. `T` should follow the structure of a row in the queried table. See the [Query String](#query-string) section for an example of what `T` should look like. The two fields of a `SqlChange` are the `Item` field of type `T` which stores the row, and the `Operation` field of type `SqlChangeOperation` which indicates the type of operaton done to the row (either an insert, update, or delete).
+
+Any time changes happen to the "Products" table, the function is triggered with a list of changes that occurred. The changes are processed sequentially, so the function will be triggered by the earliest changes first.
+
+```csharp
+[FunctionName("ProductsTrigger")]
+public static void Run(
+    [SqlTrigger("Products", ConnectionStringSetting = "SqlConnectionString")]
+    IReadOnlyList<SqlChange<Product>> changes,
+    ILogger logger)
+{
+    foreach (var change in changes)
+    {
+        Product product = change.Item;
+        logger.LogInformation($"Change occurred to Products table row: {change.Operation}");
+        logger.LogInformation($"ProductID: {product.ProductID}, Name: {product.Name}, Price: {product.Cost}");
+    }
+}
+```
 
 ### Trigger
 

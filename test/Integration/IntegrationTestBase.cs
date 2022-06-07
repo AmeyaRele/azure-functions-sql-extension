@@ -11,7 +11,6 @@ using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
 using Xunit.Abstractions;
@@ -24,7 +23,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
         /// <summary>
         /// Host process for Azure Function CLI
         /// </summary>
-        private Process FunctionHost;
+        protected Process FunctionHost { get; private set; }
 
         /// <summary>
         /// Host process for Azurite local storage emulator. This is required for non-HTTP trigger functions:
@@ -61,8 +60,8 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
         public IntegrationTestBase(ITestOutputHelper output)
         {
             this.TestOutput = output;
-
             this.SetupDatabase();
+            this.StartAzurite();
         }
 
         /// <summary>
@@ -106,12 +105,14 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             this.MasterConnectionString = connectionStringBuilder.ToString();
 
             // Create database
+            // Retry this in case the server isn't fully initialized yet
             this.DatabaseName = TestUtils.GetUniqueDBName("SqlBindingsTest");
-            using (var masterConnection = new SqlConnection(this.MasterConnectionString))
+            TestUtils.Retry(() =>
             {
+                using var masterConnection = new SqlConnection(this.MasterConnectionString);
                 masterConnection.Open();
                 TestUtils.ExecuteNonQuery(masterConnection, $"CREATE DATABASE [{this.DatabaseName}]");
-            }
+            });
 
             // Setup connection
             connectionStringBuilder.InitialCatalog = this.DatabaseName;
@@ -136,6 +137,20 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
                 Console.WriteLine($"Executing script ${file}");
                 this.ExecuteNonQuery(File.ReadAllText(file));
             }
+        }
+
+        private void EnableChangeTracking()
+        {
+            string enableChangeTrackingDatabaseQuery = $@"ALTER DATABASE [{this.DatabaseName}]
+                SET CHANGE_TRACKING = ON
+                (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
+                ";
+            this.ExecuteNonQuery(enableChangeTrackingDatabaseQuery);
+            string enableChangeTrackingTableQuery = $@"
+                ALTER TABLE [Products]
+                ENABLE CHANGE_TRACKING
+                WITH (TRACK_COLUMNS_UPDATED = ON);";
+            this.ExecuteNonQuery(enableChangeTrackingTableQuery);
         }
 
         /// <summary>
@@ -165,13 +180,19 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
         /// </remarks>
         protected void StartFunctionHost(string functionName, bool useTestFolder = false)
         {
+            string workingDirectory = useTestFolder ? GetPathToBin() : Path.Combine(GetPathToBin(), "SqlExtensionSamples");
+            if (!Directory.Exists(workingDirectory))
+            {
+                throw new FileNotFoundException("Working directory not found at " + workingDirectory);
+            }
+            this.EnableChangeTracking();
             var startInfo = new ProcessStartInfo
             {
                 // The full path to the Functions CLI is required in the ProcessStartInfo because UseShellExecute is set to false.
                 // We cannot both use shell execute and redirect output at the same time: https://docs.microsoft.com//dotnet/api/system.diagnostics.processstartinfo.redirectstandardoutput#remarks
                 FileName = GetFunctionsCoreToolsPath(),
                 Arguments = $"start --verbose --port {this.Port} --functions {functionName}",
-                WorkingDirectory = useTestFolder ? GetPathToBin() : Path.Combine(GetPathToBin(), "SqlExtensionSamples"),
+                WorkingDirectory = workingDirectory,
                 WindowStyle = ProcessWindowStyle.Hidden,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -189,7 +210,19 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             this.FunctionHost.BeginOutputReadLine();
             this.FunctionHost.BeginErrorReadLine();
 
-            Thread.Sleep(10000);     // This is just to give some time to func host to start, maybe there's a better way to do this (check if port's open?)
+            var taskCompletionSource = new TaskCompletionSource<bool>();
+            this.FunctionHost.OutputDataReceived += (object sender, DataReceivedEventArgs e) =>
+            {
+                // This string is printed after the function host is started up - use this to ensure that we wait long enough
+                // since sometimes the host can take a little while to fully start up
+                if (e != null && !string.IsNullOrEmpty(e.Data) && e.Data.Contains($"http://localhost:{this.Port}/api"))
+                {
+                    taskCompletionSource.SetResult(true);
+                }
+            };
+            this.TestOutput.WriteLine($"Waiting for Azure Function host to start...");
+            taskCompletionSource.Task.Wait(60000);
+            this.TestOutput.WriteLine($"Azure Function host started!");
         }
 
         private static string GetFunctionsCoreToolsPath()
@@ -209,7 +242,17 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
 
             if (!File.Exists(funcPath))
             {
-                throw new FileNotFoundException("Azure Function Core Tools not found at " + funcPath);
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    // Search Program Files folder as well
+                    string programFilesFuncPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Azure Functions Core Tools", funcExe);
+                    if (File.Exists(programFilesFuncPath))
+                    {
+                        return programFilesFuncPath;
+                    }
+                    throw new FileNotFoundException($"Azure Function Core Tools not found at {funcPath} or {programFilesFuncPath}");
+                }
+                throw new FileNotFoundException($"Azure Function Core Tools not found at {funcPath}");
             }
 
             return funcPath;
@@ -296,17 +339,6 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             {
                 this.TestOutput.WriteLine($"Failed to close connection. Error: {e1.Message}");
             }
-            try
-            {
-                // Drop the test database
-                using var masterConnection = new SqlConnection(this.MasterConnectionString);
-                masterConnection.Open();
-                TestUtils.ExecuteNonQuery(masterConnection, $"DROP DATABASE IF EXISTS {this.DatabaseName}");
-            }
-            catch (Exception e2)
-            {
-                this.TestOutput.WriteLine($"Failed to drop {this.DatabaseName}, Error: {e2.Message}");
-            }
             finally
             {
                 this.Connection.Dispose();
@@ -317,9 +349,9 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
                     this.FunctionHost?.Kill();
                     this.FunctionHost?.Dispose();
                 }
-                catch (Exception e3)
+                catch (Exception e2)
                 {
-                    this.TestOutput.WriteLine($"Failed to stop function host, Error: {e3.Message}");
+                    this.TestOutput.WriteLine($"Failed to stop function host, Error: {e2.Message}");
                 }
 
                 try
@@ -327,9 +359,20 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
                     this.AzuriteHost?.Kill();
                     this.AzuriteHost?.Dispose();
                 }
+                catch (Exception e3)
+                {
+                    this.TestOutput.WriteLine($"Failed to stop Azurite, Error: {e3.Message}");
+                }
+                try
+                {
+                    // Drop the test database
+                    using var masterConnection = new SqlConnection(this.MasterConnectionString);
+                    masterConnection.Open();
+                    TestUtils.ExecuteNonQuery(masterConnection, $"DROP DATABASE IF EXISTS {this.DatabaseName}");
+                }
                 catch (Exception e4)
                 {
-                    this.TestOutput.WriteLine($"Failed to stop Azurite, Error: {e4.Message}");
+                    this.TestOutput.WriteLine($"Failed to drop {this.DatabaseName}, Error: {e4.Message}");
                 }
             }
             GC.SuppressFinalize(this);
