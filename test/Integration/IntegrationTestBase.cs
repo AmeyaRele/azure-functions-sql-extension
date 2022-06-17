@@ -139,7 +139,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             }
         }
 
-        private void EnableChangeTracking()
+        protected void EnableChangeTracking()
         {
             string enableChangeTrackingDatabaseQuery = $@"ALTER DATABASE [{this.DatabaseName}]
                 SET CHANGE_TRACKING = ON
@@ -149,7 +149,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             string enableChangeTrackingTableQuery = $@"
                 ALTER TABLE [Products]
                 ENABLE CHANGE_TRACKING
-                WITH (TRACK_COLUMNS_UPDATED = ON);";
+                WITH (TRACK_COLUMNS_UPDATED = ON);
+                ALTER TABLE [ProductsWithMultiplePrimaryColumnsAndIdentity]
+                ENABLE CHANGE_TRACKING
+                WITH (TRACK_COLUMNS_UPDATED = ON);
+                ";
             this.ExecuteNonQuery(enableChangeTrackingTableQuery);
         }
 
@@ -185,7 +189,6 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             {
                 throw new FileNotFoundException("Working directory not found at " + workingDirectory);
             }
-            this.EnableChangeTracking();
             var startInfo = new ProcessStartInfo
             {
                 // The full path to the Functions CLI is required in the ProcessStartInfo because UseShellExecute is set to false.
@@ -225,6 +228,54 @@ namespace Microsoft.Azure.WebJobs.Extensions.Sql.Tests.Integration
             this.TestOutput.WriteLine($"Azure Function host started!");
         }
 
+        protected Process StartFunctionHostTrigger(string functionName, int port, bool useTestFolder = false)
+        {
+            Process FunctionHost;
+            string workingDirectory = useTestFolder ? GetPathToBin() : Path.Combine(GetPathToBin(), "SqlExtensionSamples");
+
+            if (!Directory.Exists(workingDirectory))
+            {
+                throw new FileNotFoundException("Working directory not found at " + workingDirectory);
+            }
+            var startInfo = new ProcessStartInfo
+            {
+                // The full path to the Functions CLI is required in the ProcessStartInfo because UseShellExecute is set to false.
+                // We cannot both use shell execute and redirect output at the same time: https://docs.microsoft.com//dotnet/api/system.diagnostics.processstartinfo.redirectstandardoutput#remarks
+                FileName = GetFunctionsCoreToolsPath(),
+                Arguments = $"start --verbose --port {port} --functions {functionName}",
+                WorkingDirectory = workingDirectory,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            };
+            this.TestOutput.WriteLine($"Starting {startInfo.FileName} {startInfo.Arguments} in {startInfo.WorkingDirectory}");
+            FunctionHost = new Process
+            {
+                StartInfo = startInfo
+            };
+            FunctionHost.OutputDataReceived += this.TestOutputHandler;
+            FunctionHost.ErrorDataReceived += this.TestOutputHandler;
+
+            FunctionHost.Start();
+            FunctionHost.BeginOutputReadLine();
+            FunctionHost.BeginErrorReadLine();
+
+            var taskCompletionSource = new TaskCompletionSource<bool>();
+            FunctionHost.OutputDataReceived += (object sender, DataReceivedEventArgs e) =>
+            {
+                // This string is printed after the function host is started up - use this to ensure that we wait long enough
+                // since sometimes the host can take a little while to fully start up
+                if (e != null && !string.IsNullOrEmpty(e.Data) && e.Data.Contains($"http://localhost:{port}/api"))
+                {
+                    taskCompletionSource.SetResult(true);
+                }
+            };
+            this.TestOutput.WriteLine($"Waiting for Azure Function host to start...");
+            taskCompletionSource.Task.Wait(60000);
+            this.TestOutput.WriteLine($"Azure Function host started!");
+            return FunctionHost;
+        }
         private static string GetFunctionsCoreToolsPath()
         {
             // Determine npm install path from either env var set by pipeline or OS defaults
